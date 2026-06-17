@@ -1,7 +1,8 @@
-"""Collect SLURM job info from one or more hosts over SSH.
+"""Collect job info from one or more hosts over SSH.
 
-Read-only by design: the only remote command ever run is ``squeue``. There is
-no code path that can cancel, submit, or otherwise mutate a cluster.
+Read-only by design: the only remote commands ever run are ``squeue`` (SLURM
+hosts) and ``nvidia-smi`` + ``ps`` (non-SLURM GPU hosts). There is no code path
+that can cancel, submit, or otherwise mutate a host.
 
 The module is deliberately UI-agnostic — it returns plain dataclasses whose
 ``to_dict()`` produces a JSON-ready structure. The terminal UI consumes the
@@ -12,7 +13,9 @@ verbatim.
 from __future__ import annotations
 
 import json
+import os
 import re
+import shlex
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +61,9 @@ class Job:
     submit_time: str
     # Fraction of time limit consumed (0..1), or None if limit is unbounded.
     progress: Optional[float] = None
+    # Set only for non-SLURM GPU hosts (process view): GPU memory used + owner.
+    gpu_mem_mb: Optional[int] = None
+    user: str = ""
 
     @property
     def bucket(self) -> str:
@@ -79,6 +85,8 @@ class Host:
     ok: bool = True
     error: Optional[str] = None
     jobs: list[Job] = field(default_factory=list)
+    kind: str = "slurm"  # "slurm" | "gpu"
+    note: str = ""       # freeform status line (e.g. GPU util/memory)
 
     @property
     def running(self) -> int:
@@ -105,6 +113,8 @@ class Host:
             "name": self.name,
             "ok": self.ok,
             "error": self.error,
+            "kind": self.kind,
+            "note": self.note,
             "summary": {
                 "running": self.running,
                 "pending": self.pending,
@@ -229,6 +239,125 @@ def parse_squeue_output(text: str) -> list[Job]:
 
 
 # --------------------------------------------------------------------------- #
+# Non-SLURM GPU hosts (nvidia-smi + ps)
+# --------------------------------------------------------------------------- #
+# Single SSH round-trip: emit a GPU inventory section then one line per GPU
+# process, joining each PID to its command/elapsed/user via `ps`. Read-only.
+GPU_CMD = (
+    'echo "@@GPUS"; '
+    'nvidia-smi --query-gpu=uuid,index,name,utilization.gpu,memory.used,memory.total '
+    '--format=csv,noheader,nounits 2>/dev/null; '
+    'echo "@@PROCS"; '
+    'nvidia-smi --query-compute-apps=pid,gpu_uuid,used_memory '
+    '--format=csv,noheader,nounits 2>/dev/null | '
+    'while IFS="," read -r pid uuid mem; do '
+    'pid=$(echo "$pid" | tr -d " "); [ -z "$pid" ] && continue; '
+    'uuid=$(echo "$uuid" | tr -d " "); mem=$(echo "$mem" | tr -d " "); '
+    'et=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d " "); '
+    'us=$(ps -o user= -p "$pid" 2>/dev/null | tr -d " "); '
+    'ar=$(ps -o args= -p "$pid" 2>/dev/null | tr "|" "/" | tr "\\n" " "); '
+    'echo "${pid}|${uuid}|${mem}|${et}|${us}|${ar}"; '
+    'done'
+)
+
+# Flags ML scripts commonly use to name a run; value becomes the display name.
+_RUN_NAME_FLAGS = {
+    "--name", "--run-name", "--run_name", "--exp", "--exp-name", "--exp_name",
+    "--experiment", "--experiment-name", "--experiment_name", "--job-name",
+    "--job_name", "-n",
+}
+_INTERPRETERS = {"python", "python3", "python2", "sh", "bash", "torchrun"}
+
+
+def gpu_run_label(args: str) -> str:
+    """Derive a readable run name from a process command line."""
+    toks = args.split()
+    if not toks:
+        return "(unknown)"
+    # 1) explicit run-name flag (--name foo  or  --name=foo)
+    for i, tok in enumerate(toks):
+        if "=" in tok:
+            key, val = tok.split("=", 1)
+            if key in _RUN_NAME_FLAGS and val:
+                return val
+        elif tok in _RUN_NAME_FLAGS and i + 1 < len(toks):
+            return toks[i + 1]
+    # 2) first script argument (e.g. train.py)
+    for tok in toks:
+        if tok.endswith(".py"):
+            return os.path.basename(tok)
+    # 3) fall back to the executable basename, skipping the interpreter
+    base = os.path.basename(toks[0])
+    if base in _INTERPRETERS and len(toks) > 1:
+        return os.path.basename(toks[1])
+    return base
+
+
+def parse_gpu_output(text: str) -> tuple[list[dict], list[Job]]:
+    """Parse GPU_CMD output into (gpu inventory, aggregated process Jobs)."""
+    gpus: list[dict] = []
+    raw_procs: list[list[str]] = []
+    section = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s == "@@GPUS":
+            section = "gpus"
+            continue
+        if s == "@@PROCS":
+            section = "procs"
+            continue
+        if not s:
+            continue
+        if section == "gpus":
+            parts = [p.strip() for p in s.split(",")]
+            if len(parts) >= 6:
+                gpus.append({
+                    "uuid": parts[0], "index": parts[1], "name": parts[2],
+                    "util": parts[3], "mem_used": parts[4], "mem_total": parts[5],
+                })
+        elif section == "procs":
+            parts = s.split("|", 5)
+            if len(parts) == 6:
+                raw_procs.append(parts)
+
+    uuid_to_index = {g["uuid"]: g["index"] for g in gpus}
+    by_pid: dict[str, dict] = {}
+    for pid, uuid, mem, etime, user, args in raw_procs:
+        entry = by_pid.setdefault(
+            pid, {"mem": 0, "gpus": set(), "etime": etime, "user": user, "args": args}
+        )
+        entry["mem"] += _to_int(mem)
+        entry["gpus"].add(uuid_to_index.get(uuid, uuid))
+
+    jobs = []
+    for pid, e in by_pid.items():
+        idxs = sorted(e["gpus"])
+        partition = "GPU " + ",".join(idxs) if idxs else "GPU"
+        jobs.append(Job(
+            jobid=pid, name=gpu_run_label(e["args"]), state="RUNNING",
+            partition=partition, elapsed=e["etime"], time_limit="",
+            nodes=1, cpus=0, gpus=max(1, len(e["gpus"])), reason="",
+            submit_time="", progress=None, gpu_mem_mb=e["mem"], user=e["user"],
+        ))
+    return gpus, jobs
+
+
+def gpu_note(gpus: list[dict]) -> str:
+    """One-line GPU status (shown even when the GPU is idle)."""
+    if not gpus:
+        return ""
+    used = sum(_to_int(g["mem_used"]) for g in gpus)
+    total = sum(_to_int(g["mem_total"]) for g in gpus)
+    utils = [_to_int(g["util"]) for g in gpus]
+    avg_util = sum(utils) // len(utils) if utils else 0
+    used_gb, total_gb = used / 1024, total / 1024
+    if len(gpus) == 1:
+        name = gpus[0]["name"].replace("NVIDIA ", "").replace("GeForce ", "")
+        return f"{name} · {avg_util}% util · {used_gb:.1f}/{total_gb:.0f} GB"
+    return f"{len(gpus)}× GPU · {avg_util}% util · {used_gb:.1f}/{total_gb:.0f} GB"
+
+
+# --------------------------------------------------------------------------- #
 # Collection
 # --------------------------------------------------------------------------- #
 def _build_squeue_cmd() -> str:
@@ -237,18 +366,21 @@ def _build_squeue_cmd() -> str:
 
 def _collect_host(spec: dict) -> Host:
     name = spec.get("name", spec.get("ssh") or "host")
-    host = Host(name=name)
-    squeue = _build_squeue_cmd()
+    scheduler = spec.get("scheduler", "slurm").lower()
+    host = Host(name=name, kind="gpu" if scheduler in ("gpu", "nvidia") else "slurm")
+    remote_cmd = GPU_CMD if host.kind == "gpu" else _build_squeue_cmd()
 
     if spec.get("local"):
-        argv = ["/bin/sh", "-c", squeue]
+        argv = ["/bin/sh", "-c", remote_cmd]
     else:
         alias = spec.get("ssh")
         if not alias:
             host.ok = False
             host.error = "no 'ssh' alias and not marked 'local'"
             return host
-        argv = ["ssh", *DEFAULT_SSH_OPTS, alias, squeue]
+        # Force POSIX sh: the remote login shell may be fish/csh, which can't
+        # parse our command. shlex.quote keeps this safe across shells.
+        argv = ["ssh", *DEFAULT_SSH_OPTS, alias, "/bin/sh -c " + shlex.quote(remote_cmd)]
 
     try:
         proc = subprocess.run(
@@ -276,7 +408,16 @@ def _collect_host(spec: dict) -> Host:
         host.error = err[-1] if err else f"exit code {proc.returncode}"
         return host
 
-    host.jobs = parse_squeue_output(proc.stdout)
+    if host.kind == "gpu":
+        gpus, jobs = parse_gpu_output(proc.stdout)
+        if not gpus:
+            host.ok = False
+            host.error = "nvidia-smi returned no GPUs (driver/tool missing?)"
+            return host
+        host.note = gpu_note(gpus)
+        host.jobs = jobs
+    else:
+        host.jobs = parse_squeue_output(proc.stdout)
     return host
 
 

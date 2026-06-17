@@ -71,8 +71,20 @@ def _progress_bar(frac: Optional[float], width: int = 12) -> Text:
     return bar
 
 
+def _fmt_mem(mb: Optional[int]) -> str:
+    if not mb:
+        return ""
+    return f"{mb / 1024:.1f}G" if mb >= 1024 else f"{mb}M"
+
+
 def _resources(job: Job) -> Text:
     t = Text()
+    # GPU-process view (non-SLURM hosts): show GPU count + memory used.
+    if job.gpu_mem_mb is not None:
+        t.append(f"{job.gpus}", style="bold magenta")
+        t.append("gpu ", style="magenta")
+        t.append(_fmt_mem(job.gpu_mem_mb), style="grey70")
+        return t
     t.append(f"{job.nodes}n ", style="grey70")
     t.append(f"{job.cpus}c", style="grey70")
     if job.gpus:
@@ -98,8 +110,13 @@ def _jobs_table(jobs: list[Job]) -> Table:
         style = _STATE_STYLE.get(job.bucket, "white")
         dot = Text(_DOT, style=style)
         if job.bucket == "running":
-            time_cell: RenderableType = _progress_bar(job.progress)
-            info = Text(job.state.title(), style=style)
+            if job.progress is not None:
+                time_cell: RenderableType = _progress_bar(job.progress)
+            elif job.elapsed:
+                time_cell = Text(job.elapsed, style="dim")
+            else:
+                time_cell = Text("running", style="dim")
+            info = Text(job.user or job.state.title(), style=style)
         elif job.bucket == "pending":
             time_cell = Text(f"limit {job.time_limit}", style="dim")
             info = Text(job.reason or "Pending", style="yellow")
@@ -123,22 +140,31 @@ def _host_panel(host: Host, jobs: list[Job]) -> Panel:
 
     subtitle = Text()
     subtitle.append(f"{host.running} run", style="green")
-    subtitle.append("  ")
-    subtitle.append(f"{host.pending} pend", style="yellow")
+    if host.kind != "gpu":
+        subtitle.append("  ")
+        subtitle.append(f"{host.pending} pend", style="yellow")
     if host.other:
         subtitle.append("  ")
         subtitle.append(f"{host.other} other", style="cyan")
-    subtitle.append("   ")
-    subtitle.append(f"{host.cpus_in_use} cpu", style="grey70")
-    if host.gpus_in_use:
+    if host.cpus_in_use:
+        subtitle.append("   ")
+        subtitle.append(f"{host.cpus_in_use} cpu", style="grey70")
+    if host.gpus_in_use and host.kind != "gpu":
         subtitle.append("  ")
         subtitle.append(f"{host.gpus_in_use} gpu", style="magenta")
+    if host.note:
+        subtitle.append("   ")
+        subtitle.append(host.note, style="grey62")
 
     if not host.ok:
         body: RenderableType = Text(f"unreachable — {host.error}", style="red")
     elif not jobs:
-        body = Text("no jobs match" if host.jobs else "no jobs queued",
-                    style="dim italic")
+        if host.kind == "gpu":
+            body = Text("no jobs match" if host.jobs else "GPU idle — no compute processes",
+                        style="dim italic")
+        else:
+            body = Text("no jobs match" if host.jobs else "no jobs queued",
+                        style="dim italic")
     else:
         body = _jobs_table(jobs)
 

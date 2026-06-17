@@ -37,9 +37,18 @@ def make_demo_snapshot(_config=None) -> Snapshot:
         _job("312", "local-notebook", "RUNNING", "local",
              "03:21:00", "", 1, 2, 1, progress=None),
     ])
+    larry = Host(name="Larry (desktop GPU)", kind="gpu",
+                 note="RTX 3090 · 73% util · 17.8/24 GB", jobs=[
+        Job(jobid="40123", name="diffusion-v2", state="RUNNING", partition="GPU 0",
+            elapsed="2-03:14:05", time_limit="", nodes=1, cpus=0, gpus=1,
+            reason="", submit_time="", gpu_mem_mb=12000, user="david"),
+        Job(jobid="40555", name="eval.py", state="RUNNING", partition="GPU 0",
+            elapsed="11:02", time_limit="", nodes=1, cpus=0, gpus=1,
+            reason="", submit_time="", gpu_mem_mb=6200, user="david"),
+    ])
     unreachable = Host(name="LISA", ok=False,
                        error="ssh: connect to host lisa port 22: Operation timed out")
     return Snapshot(
         generated_at=time.time(),
-        hosts=[snellius, das6, desktop, unreachable],
+        hosts=[snellius, das6, desktop, larry, unreachable],
     )

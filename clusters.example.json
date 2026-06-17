@@ -18,6 +18,13 @@
       "ssh": null,
       "partitions": [],
       "local": true
+    },
+    {
+      "name": "Workstation GPU",
+      "ssh": "my-gpu-box",
+      "scheduler": "gpu",
+      "partitions": [],
+      "local": false
     }
   ]
 }

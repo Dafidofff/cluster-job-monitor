@@ -60,6 +60,12 @@ python run.py --once --demo   # print one synthetic snapshot and exit
    alias; set `"local": true` for the machine you run the tool on (no SSH).
    `clusters.json` is git-ignored.
 
+   **Non-SLURM GPU box?** Add `"scheduler": "gpu"` to that host. Instead of
+   `squeue` it runs `nvidia-smi` + `ps` and shows one row per GPU process —
+   the run name (from a `--name`/`--run-name`/`--experiment` arg, else the
+   script name), GPU memory used, elapsed time, and the owner — plus a GPU
+   utilisation/memory line. Works through any login shell (fish, csh, …).
+
 3. **Run it:**
 
    ```bash
