@@ -1,0 +1,11 @@
+# Personal cluster config — never commit (host aliases, partitions).
+clusters.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store

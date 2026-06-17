@@ -1,0 +1,2 @@
+# Terminal UI. `textual` pulls in `rich`, which the renderers and --once mode use.
+textual>=0.60

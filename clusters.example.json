@@ -1,0 +1,23 @@
+{
+  "refresh_seconds": 30,
+  "hosts": [
+    {
+      "name": "Snellius",
+      "ssh": "snellius",
+      "partitions": ["gpu", "gpu_a100"],
+      "local": false
+    },
+    {
+      "name": "DAS6",
+      "ssh": "das6",
+      "partitions": ["defq"],
+      "local": false
+    },
+    {
+      "name": "Desktop",
+      "ssh": null,
+      "partitions": [],
+      "local": true
+    }
+  ]
+}
