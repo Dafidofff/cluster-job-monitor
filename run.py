@@ -55,9 +55,11 @@ def main() -> int:
         from rich.console import Console
         from tui.render import Filters, render_body, render_header
         snapshot = collect_fn(config)
+        minimized = {h["name"] for h in config.get("hosts", [])
+                     if h.get("minimized") and h.get("name")}
         console = Console()
         console.print(render_header(snapshot, Filters(), refreshing=False))
-        console.print(render_body(snapshot, Filters()))
+        console.print(render_body(snapshot, Filters(), minimized))
         return 0
 
     from tui.app import JobMonitorApp

@@ -34,8 +34,11 @@ class JobMonitorApp(App):
         Binding("c", "cycle_host", "Cluster"),
         Binding("p", "cycle_partition", "Partition"),
         Binding("slash", "search", "Search"),
+        Binding("m", "toggle_all_min", "Min all"),
         Binding("escape", "clear", "Clear filters"),
         Binding("q", "quit", "Quit"),
+        *[Binding(str(n), f"toggle_min('{n}')", f"Min {n}", show=False)
+          for n in range(1, 10)],
     ]
 
     def __init__(self, config: dict, collect_fn=collect) -> None:
@@ -45,6 +48,12 @@ class JobMonitorApp(App):
         self.snapshot: Optional[Snapshot] = None
         self.filters = Filters()
         self._refreshing = False
+        # Clusters collapsed to a one-line summary. Seeded from config
+        # ("minimized": true), then toggled live with number keys / `m`.
+        self.minimized: set[str] = {
+            h["name"] for h in config.get("hosts", [])
+            if h.get("minimized") and h.get("name")
+        }
 
     def compose(self) -> ComposeResult:
         yield Static(id="header")
@@ -78,7 +87,7 @@ class JobMonitorApp(App):
     def _render(self) -> None:
         self._render_header()
         self.query_one("#body", Static).update(
-            render_body(self.snapshot, self.filters)
+            render_body(self.snapshot, self.filters, self.minimized)
         )
 
     def _render_header(self) -> None:
@@ -107,6 +116,25 @@ class JobMonitorApp(App):
         self.filters.partition = _cycle(
             all_partitions(self.snapshot), self.filters.partition
         )
+        self._render()
+
+    def action_toggle_min(self, num: str) -> None:
+        hosts = self.snapshot.hosts if self.snapshot else []
+        idx = int(num) - 1
+        if 0 <= idx < len(hosts):
+            name = hosts[idx].name
+            self.minimized.symmetric_difference_update({name})
+            self._render()
+
+    def action_toggle_all_min(self) -> None:
+        if not self.snapshot:
+            return
+        names = {h.name for h in self.snapshot.hosts}
+        # If anything is currently expanded, collapse everything; else expand all.
+        if names - self.minimized:
+            self.minimized |= names
+        else:
+            self.minimized.clear()
         self._render()
 
     def action_search(self) -> None:

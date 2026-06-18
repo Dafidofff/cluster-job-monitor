@@ -130,31 +130,50 @@ def _jobs_table(jobs: list[Job]) -> Table:
     return table
 
 
-def _host_panel(host: Host, jobs: list[Job]) -> Panel:
-    title = Text()
-    if host.ok:
-        title.append(f"{_DOT} ", style="green")
+def _summary_text(host: Host) -> Text:
+    """Compact per-host counts, shared by the expanded subtitle and the
+    collapsed one-liner so the two views never drift."""
+    t = Text()
+    t.append(f"{host.running} run", style="green")
+    if host.kind != "gpu":
+        t.append("  ")
+        t.append(f"{host.pending} pend", style="yellow")
+    if host.other:
+        t.append("  ")
+        t.append(f"{host.other} other", style="cyan")
+    if host.cpus_in_use:
+        t.append("   ")
+        t.append(f"{host.cpus_in_use} cpu", style="grey70")
+    if host.gpus_in_use and host.kind != "gpu":
+        t.append("  ")
+        t.append(f"{host.gpus_in_use} gpu", style="magenta")
+    if host.note:
+        t.append("   ")
+        t.append(host.note, style="grey62")
+    return t
+
+
+def _host_collapsed(host: Host, index: int) -> Text:
+    """A minimised cluster: one line, no job table."""
+    t = Text()
+    t.append(f"{index} ▸ ", style="grey50")
+    t.append(f"{_DOT} ", style="green" if host.ok else "red")
+    t.append(host.name, style="bold")
+    if not host.ok:
+        t.append(f"   unreachable — {host.error}", style="red")
     else:
-        title.append(f"{_DOT} ", style="red")
+        t.append("   ")
+        t.append_text(_summary_text(host))
+    return t
+
+
+def _host_panel(host: Host, jobs: list[Job], index: int) -> Panel:
+    title = Text()
+    title.append(f"{index} ▾ ", style="grey50")
+    title.append(f"{_DOT} ", style="green" if host.ok else "red")
     title.append(host.name, style="bold")
 
-    subtitle = Text()
-    subtitle.append(f"{host.running} run", style="green")
-    if host.kind != "gpu":
-        subtitle.append("  ")
-        subtitle.append(f"{host.pending} pend", style="yellow")
-    if host.other:
-        subtitle.append("  ")
-        subtitle.append(f"{host.other} other", style="cyan")
-    if host.cpus_in_use:
-        subtitle.append("   ")
-        subtitle.append(f"{host.cpus_in_use} cpu", style="grey70")
-    if host.gpus_in_use and host.kind != "gpu":
-        subtitle.append("  ")
-        subtitle.append(f"{host.gpus_in_use} gpu", style="magenta")
-    if host.note:
-        subtitle.append("   ")
-        subtitle.append(host.note, style="grey62")
+    subtitle = _summary_text(host)
 
     if not host.ok:
         body: RenderableType = Text(f"unreachable — {host.error}", style="red")
@@ -202,21 +221,27 @@ def render_header(snapshot: Optional[Snapshot], filters: Filters,
     return t
 
 
-def render_body(snapshot: Optional[Snapshot], filters: Filters) -> RenderableType:
+def render_body(snapshot: Optional[Snapshot], filters: Filters,
+                minimized: Optional[set[str]] = None) -> RenderableType:
     if snapshot is None:
         return Text("\n  Connecting to clusters…", style="dim")
     if not snapshot.hosts:
         return Text("\n  No hosts configured.", style="dim")
 
-    panels = []
-    for host in snapshot.hosts:
+    minimized = minimized or set()
+    items: list[RenderableType] = []
+    # Enumerate before filtering so the index next to each cluster is stable.
+    for index, host in enumerate(snapshot.hosts, 1):
         if filters.host and host.name != filters.host:
             continue
-        jobs = [j for j in host.jobs if filters.match(j)]
-        panels.append(_host_panel(host, jobs))
-    if not panels:
+        if host.name in minimized:
+            items.append(_host_collapsed(host, index))
+        else:
+            jobs = [j for j in host.jobs if filters.match(j)]
+            items.append(_host_panel(host, jobs, index))
+    if not items:
         return Text("\n  No clusters match the current filter.", style="dim")
-    return Group(*panels)
+    return Group(*items)
 
 
 def all_partitions(snapshot: Optional[Snapshot]) -> list[str]:
