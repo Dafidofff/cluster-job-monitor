@@ -1,0 +1,19 @@
+[tool.pytest.ini_options]
+# Make the top-level packages (core, tui) and run.py importable in tests
+# without installing the project.
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+branch = true
+source = ["core", "tui", "run"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise SystemExit",
+]

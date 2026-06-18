@@ -1,5 +1,10 @@
 # Cluster Jobs — terminal dashboard
 
+[![CI](https://github.com/Dafidofff/cluster-job-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Dafidofff/cluster-job-monitor/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/Dafidofff/cluster-job-monitor/branch/main/graph/badge.svg)](https://codecov.io/gh/Dafidofff/cluster-job-monitor)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 A read-only terminal dashboard that shows your SLURM jobs across several
 clusters **and** your desktop in one view. It SSHes into each host, runs
 `squeue --me`, and renders a live, colour-coded overview.
@@ -112,6 +117,18 @@ cluster-jobs/
 `Snapshot` whose `.to_dict()` is JSON-ready — that's the seam for a future
 web/phone dashboard (push the dict to an authenticated endpoint and render it
 in a browser), without changing the collector.
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+pytest                       # run the suite
+pytest --cov --cov-report=term-missing   # with coverage (~94%)
+```
+
+Tests live in `tests/` and mock SSH/`subprocess`, so they run anywhere — no
+cluster access needed. CI ([GitHub Actions](.github/workflows/ci.yml)) runs
+them on Python 3.10–3.12 and reports coverage to Codecov.
 
 ## License
 
