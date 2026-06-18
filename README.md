@@ -112,3 +112,8 @@ cluster-jobs/
 `Snapshot` whose `.to_dict()` is JSON-ready — that's the seam for a future
 web/phone dashboard (push the dict to an authenticated endpoint and render it
 in a browser), without changing the collector.
+
+## License
+
+[MIT](LICENSE) © David Wessels. You're free to use, modify, and redistribute
+it; just keep the copyright notice and license text in any copies.
