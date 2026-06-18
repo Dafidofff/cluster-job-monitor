@@ -29,12 +29,35 @@ jobs:
       - name: Run tests with coverage
         run: pytest --cov --cov-report=xml --cov-report=term-missing
 
-      - name: Upload coverage to Codecov
+      - name: Upload coverage artifact
         if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v4
+        uses: actions/upload-artifact@v4
         with:
-          files: ./coverage.xml
-          # Optional for public repos; add a CODECOV_TOKEN repo secret to make
-          # uploads reliable (Codecov occasionally rate-limits tokenless ones).
+          name: coverage-xml
+          path: coverage.xml
+
+  upload-coverage:
+    needs: test
+    runs-on: ubuntu-latest
+    # Only upload on push — keeps id-token:write away from untrusted PR code
+    # and avoids failing fork PRs where secrets are unavailable.
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          use_oidc: true
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          files: ./coverage.xml
+          fail_ci_if_error: true
