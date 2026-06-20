@@ -255,3 +255,89 @@ def all_hosts(snapshot: Optional[Snapshot]) -> list[str]:
     if snapshot is None:
         return []
     return [h.name for h in snapshot.hosts]
+
+
+# --------------------------------------------------------------------------- #
+# Capacity overview (human view of build_overview())
+# --------------------------------------------------------------------------- #
+def _free_cell(free: int, total: int) -> Text:
+    """Colour a free/total figure green→yellow→red as it fills up."""
+    t = Text()
+    if total <= 0:
+        t.append("—", style="dim")
+        return t
+    frac_free = free / total
+    style = "bold green" if frac_free >= 0.34 else "bold yellow" if frac_free > 0 else "bold red"
+    t.append(str(free), style=style)
+    t.append(f"/{total}", style="grey50")
+    return t
+
+
+def _partitions_table(partitions: list[dict]) -> Table:
+    table = Table(
+        box=None, expand=True, pad_edge=False, show_edge=False,
+        header_style="dim", padding=(0, 1),
+    )
+    table.add_column("PARTITION", style="grey70", no_wrap=True)
+    table.add_column("CPUS FREE", no_wrap=True)
+    table.add_column("GPUS FREE", no_wrap=True)
+    table.add_column("NODES (idle/mix/alloc)", style="grey50", no_wrap=True)
+    table.add_column("MY JOBS", no_wrap=True)
+    for p in partitions:
+        cpus, gpus, nodes = p["cpus"], p["gpus"], p["nodes"]
+        mine = Text()
+        if p["my_running"]:
+            mine.append(f"{p['my_running']} run", style="green")
+        if p["my_pending"]:
+            if mine:
+                mine.append(" ")
+            mine.append(f"{p['my_pending']} pend", style="yellow")
+        if not mine:
+            mine.append("—", style="dim")
+        table.add_row(
+            p["name"],
+            _free_cell(cpus["free"], cpus["total"]),
+            _free_cell(gpus["free"], gpus["total"]),
+            f"{nodes['idle']}/{nodes['mixed']}/{nodes['alloc']}",
+            mine,
+        )
+    return table
+
+
+def render_overview(overview: dict) -> RenderableType:
+    """Render build_overview() output as one panel per cluster."""
+    clusters = overview.get("clusters", [])
+    if not clusters:
+        return Text("\n  No clusters configured.", style="dim")
+    items: list[RenderableType] = []
+    for c in clusters:
+        title = Text()
+        title.append(f"{_DOT} ", style="green" if c["ok"] else "red")
+        title.append(c["name"], style="bold")
+
+        subtitle = Text()
+        free, cap = c["free"], c["capacity"]
+        subtitle.append("free ", style="dim")
+        subtitle.append_text(_free_cell(free["cpus"], cap["cpus"]))
+        subtitle.append(" cpu  ", style="grey50")
+        subtitle.append_text(_free_cell(free["gpus"], cap["gpus"]))
+        subtitle.append(" gpu", style="grey50")
+        jobs = c["my_jobs"]
+        subtitle.append(f"   {jobs['running']} run", style="green")
+        subtitle.append(f"  {jobs['pending']} pend", style="yellow")
+
+        if not c["ok"]:
+            body: RenderableType = Text(f"unreachable — {c['error']}", style="red")
+        elif c["partitions"]:
+            body = _partitions_table(c["partitions"])
+        elif c["kind"] == "gpu":
+            body = Text("GPU host — see free/total above", style="dim italic")
+        else:
+            body = Text("no partition data (sinfo unavailable?)", style="dim italic")
+
+        items.append(Panel(
+            body, title=title, subtitle=subtitle, subtitle_align="left",
+            title_align="left", box=ROUNDED,
+            border_style="green" if c["ok"] else "red", padding=(0, 1),
+        ))
+    return Group(*items)

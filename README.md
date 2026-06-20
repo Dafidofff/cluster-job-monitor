@@ -9,10 +9,10 @@ A read-only terminal dashboard that shows your SLURM jobs across several
 clusters **and** your desktop in one view. It SSHes into each host, runs
 `squeue --me`, and renders a live, colour-coded overview.
 
-**Read-only by design:** the only commands ever run are `squeue` (SLURM hosts)
-and `nvidia-smi` + `ps` (non-SLURM GPU hosts). There is no code path that can
-cancel or submit jobs. It uses *your* existing SSH config and keys — nothing
-new is exposed, no server, no stored secrets.
+**Read-only by design:** the only commands ever run are `squeue` and `sinfo`
+(SLURM hosts) and `nvidia-smi` + `ps` (non-SLURM GPU hosts). There is no code
+path that can cancel or submit jobs. It uses *your* existing SSH config and
+keys — nothing new is exposed, no server, no stored secrets.
 
 ```
 ┌ CLUSTER JOBS    3 running   2 pending      updated 4s ago      filter: none ┐
@@ -81,6 +81,73 @@ python run.py --once --demo   # print one synthetic snapshot and exit
    python run.py --config ~/my-clusters.json
    ```
 
+## Agent overview (capacity, per cluster & partition)
+
+For coding agents (or scripts) that need to decide *where* to launch a job,
+there's a one-shot overview that answers two questions in a single call:
+
+- how many jobs you have **queued / running**, per cluster and per partition, and
+- how many **CPUs and GPUs are still free**, per cluster and per partition.
+
+```bash
+python run.py --overview          # human-readable capacity table
+python run.py --overview --json   # machine-readable JSON (for agents)
+python run.py --overview --demo --json   # try it with synthetic data
+```
+
+This is the only place the tool runs `sinfo` (still read-only). It's folded
+into the **same SSH round-trip** as `squeue --me`, so an overview is one
+connection per host. The JSON shape:
+
+```json
+{
+  "generated_at": 1718900000.0,
+  "clusters": [
+    {
+      "name": "Snellius", "ok": true, "error": null, "kind": "slurm",
+      "my_jobs": { "running": 2, "pending": 1 },
+      "free":     { "cpus": 224, "gpus": 14 },
+      "capacity": { "cpus": 768, "gpus": 48 },
+      "partitions": [
+        {
+          "name": "gpu_a100", "my_running": 1, "my_pending": 2,
+          "cpus":  { "free": 96,  "alloc": 416, "total": 512 },
+          "gpus":  { "free": 4,   "alloc": 28,  "total": 32 },
+          "nodes": { "idle": 0, "mixed": 6, "alloc": 2, "other": 0, "total": 8 }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Notes: `cpus.free` is sinfo's *idle* CPU count (so down/drained nodes are
+already excluded); `gpus.free` is counted only on usable nodes
+(idle/mixed/allocated). A node shared between partitions counts toward each
+partition's tally but is counted **once** in the cluster-level `free`/`capacity`
+totals. `my_running`/`my_pending` come from `squeue --me`.
+
+### As an MCP tool
+
+The same overview is exposed over MCP so an agent can call it natively, via a
+thin wrapper that adds no new cluster access:
+
+```bash
+pip install -r requirements-mcp.txt        # installs the MCP SDK
+
+# Register with Claude Code (point CLUSTER_MONITOR_CONFIG at your config):
+claude mcp add cluster-monitor \
+  -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
+  -- python /abs/path/to/mcp_server.py
+```
+
+It serves two tools:
+
+| tool               | returns                                                         |
+|--------------------|----------------------------------------------------------------|
+| `cluster_overview` | the JSON above — free CPUs/GPUs + your jobs, per cluster & part |
+| `my_jobs`          | just your jobs per cluster (skips `sinfo`, lighter)            |
+
 ## Keys
 
 | key     | action                                          |
@@ -105,10 +172,11 @@ Auto-refresh interval is `refresh_seconds` in the config (default 30).
 
 ```
 cluster-jobs/
-  run.py                 # entry point (--once, --demo, --config)
-  core/collector.py      # UI-agnostic: SSH + squeue -> Snapshot dataclasses
+  run.py                 # entry point (--once, --overview, --json, --demo, --config)
+  core/collector.py      # UI-agnostic: SSH + squeue/sinfo -> Snapshot dataclasses
+  mcp_server.py          # MCP wrapper exposing the capacity overview to agents
   tui/app.py             # Textual app (live loop, filters, keybindings)
-  tui/render.py          # Rich renderables (shared by TUI and --once)
+  tui/render.py          # Rich renderables (shared by TUI, --once, --overview)
   tui/sample.py          # synthetic snapshot for --demo
   clusters.example.json  # config template (copy to clusters.json)
 ```

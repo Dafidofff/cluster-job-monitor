@@ -1,0 +1,3 @@
+# Optional: only needed to run mcp_server.py (the agent-facing MCP wrapper).
+# The core collector and TUI do not depend on this.
+mcp>=1.2

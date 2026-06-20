@@ -1,8 +1,8 @@
 """Collect job info from one or more hosts over SSH.
 
-Read-only by design: the only remote commands ever run are ``squeue`` (SLURM
-hosts) and ``nvidia-smi`` + ``ps`` (non-SLURM GPU hosts). There is no code path
-that can cancel, submit, or otherwise mutate a host.
+Read-only by design: the only remote commands ever run are ``squeue`` and
+``sinfo`` (SLURM hosts) and ``nvidia-smi`` + ``ps`` (non-SLURM GPU hosts). There
+is no code path that can cancel, submit, or otherwise mutate a host.
 
 The module is deliberately UI-agnostic — it returns plain dataclasses whose
 ``to_dict()`` produces a JSON-ready structure. The terminal UI consumes the
@@ -20,6 +20,7 @@ import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +34,16 @@ _FIELDS = [
     "jobid", "name", "state", "partition", "elapsed",
     "time_limit", "nodes", "cpus", "tres", "reason", "submit_time",
 ]
+
+# sinfo output for the agent capacity overview. One line per node *per
+# partition* (-N), so it aggregates straight into per-partition tallies.
+# Field values never contain whitespace, so the fixed widths split cleanly.
+#   NodeHost   node name (used to dedupe shared nodes for cluster totals)
+#   Partition  partition name        StateLong  node state (idle/mixed/...)
+#   CPUsState  alloc/idle/other/total            Gres  configured GPUs
+#   GresUsed   allocated GPUs
+SINFO_FORMAT = "NodeHost:30,Partition:30,StateLong:20,CPUsState:25,Gres:50,GresUsed:50"
+SINFO_SENTINEL = "@@SINFO"
 
 # How states map to a coarse bucket used for summaries + colouring.
 RUNNING_STATES = {"RUNNING"}
@@ -80,6 +91,56 @@ class Job:
 
 
 @dataclass
+class Partition:
+    """Capacity / availability for one SLURM partition on one cluster.
+
+    ``cpus_free`` is the idle-CPU count straight from sinfo's CPUsState, so it
+    already excludes down/drained nodes. ``gpus_free`` is counted only on
+    usable nodes (idle/mixed/allocated). ``my_running``/``my_pending`` are this
+    user's jobs in the partition (folded in from ``squeue --me``).
+    """
+
+    name: str
+    cpus_free: int = 0
+    cpus_alloc: int = 0
+    cpus_total: int = 0
+    gpus_free: int = 0
+    gpus_alloc: int = 0
+    gpus_total: int = 0
+    nodes_idle: int = 0
+    nodes_mixed: int = 0
+    nodes_alloc: int = 0
+    nodes_other: int = 0
+    nodes_total: int = 0
+    my_running: int = 0
+    my_pending: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "my_running": self.my_running,
+            "my_pending": self.my_pending,
+            "cpus": {
+                "free": self.cpus_free,
+                "alloc": self.cpus_alloc,
+                "total": self.cpus_total,
+            },
+            "gpus": {
+                "free": self.gpus_free,
+                "alloc": self.gpus_alloc,
+                "total": self.gpus_total,
+            },
+            "nodes": {
+                "idle": self.nodes_idle,
+                "mixed": self.nodes_mixed,
+                "alloc": self.nodes_alloc,
+                "other": self.nodes_other,
+                "total": self.nodes_total,
+            },
+        }
+
+
+@dataclass
 class Host:
     name: str
     ok: bool = True
@@ -87,6 +148,13 @@ class Host:
     jobs: list[Job] = field(default_factory=list)
     kind: str = "slurm"  # "slurm" | "gpu"
     note: str = ""       # freeform status line (e.g. GPU util/memory)
+    # Capacity overview (populated only when collected with_partitions). The
+    # cluster-level totals dedupe nodes shared across partitions.
+    partitions: list[Partition] = field(default_factory=list)
+    cpus_free: int = 0
+    cpus_total: int = 0
+    gpus_free: int = 0
+    gpus_total: int = 0
 
     @property
     def running(self) -> int:
@@ -122,6 +190,13 @@ class Host:
                 "cpus_in_use": self.cpus_in_use,
                 "gpus_in_use": self.gpus_in_use,
             },
+            "capacity": {
+                "cpus_free": self.cpus_free,
+                "cpus_total": self.cpus_total,
+                "gpus_free": self.gpus_free,
+                "gpus_total": self.gpus_total,
+            },
+            "partitions": [p.to_dict() for p in self.partitions],
             "jobs": [j.to_dict() for j in self.jobs],
         }
 
@@ -236,6 +311,109 @@ def parse_squeue_output(text: str) -> list[Job]:
         if job is not None:
             jobs.append(job)
     return jobs
+
+
+# Node states we treat as having usable (allocatable) GPUs. Down/drained nodes
+# may report 0 GPUs used while their hardware is unavailable, so we exclude
+# them from free-GPU counts.
+_USABLE_NODE_STATES = {"idle", "mixed", "allocated"}
+
+
+def _norm_node_state(raw: str) -> str:
+    """Collapse a sinfo node state into idle/mixed/allocated/other.
+
+    sinfo may append flag characters (``*~#$@+``) to the state; strip them.
+    """
+    s = (raw or "").strip().lower().rstrip("*~#$@+-.")
+    if s.startswith("idle"):
+        return "idle"
+    if s.startswith("mix"):
+        return "mixed"
+    if s.startswith("alloc"):
+        return "allocated"
+    return "other"
+
+
+def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
+    """Parse ``sinfo -N -O SINFO_FORMAT`` into per-partition capacity.
+
+    Returns ``(partitions, host_totals)`` where ``host_totals`` holds
+    cluster-wide free/total CPUs and GPUs with shared nodes counted once.
+    Malformed lines are skipped, so partial output never raises.
+    """
+    parts: dict[str, Partition] = {}
+    seen_nodes: dict[str, tuple[int, int, int, int]] = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < 6:
+            continue
+        node, pname, raw_state, cpustate, gres, gres_used = toks[:6]
+
+        cstate = cpustate.split("/")
+        if len(cstate) == 4:
+            alloc_c, idle_c, _other_c, total_c = (_to_int(x) for x in cstate)
+        else:
+            alloc_c = idle_c = total_c = 0
+
+        gpu_total = parse_gpus(gres)
+        gpu_used = parse_gpus(gres_used)
+        state = _norm_node_state(raw_state)
+        gpu_free = max(0, gpu_total - gpu_used) if state in _USABLE_NODE_STATES else 0
+
+        p = parts.get(pname)
+        if p is None:
+            p = parts[pname] = Partition(name=pname)
+        p.cpus_free += idle_c
+        p.cpus_alloc += alloc_c
+        p.cpus_total += total_c
+        p.gpus_free += gpu_free
+        p.gpus_alloc += gpu_used
+        p.gpus_total += gpu_total
+        p.nodes_total += 1
+        if state == "idle":
+            p.nodes_idle += 1
+        elif state == "mixed":
+            p.nodes_mixed += 1
+        elif state == "allocated":
+            p.nodes_alloc += 1
+        else:
+            p.nodes_other += 1
+
+        # First time we see a node, record its contribution to cluster totals
+        # (a node in N partitions appears N times but must count once).
+        if node not in seen_nodes:
+            seen_nodes[node] = (idle_c, total_c, gpu_free, gpu_total)
+
+    host_totals = {
+        "cpus_free": sum(v[0] for v in seen_nodes.values()),
+        "cpus_total": sum(v[1] for v in seen_nodes.values()),
+        "gpus_free": sum(v[2] for v in seen_nodes.values()),
+        "gpus_total": sum(v[3] for v in seen_nodes.values()),
+    }
+    return list(parts.values()), host_totals
+
+
+def _fold_my_jobs(partitions: list[Partition], jobs: list[Job]) -> None:
+    """Add each job's running/pending count to its partition(s) in place.
+
+    A pending job may list several partitions (``gpu,gpu_a100``); count it in
+    each. Partitions named by a job but absent from sinfo are appended with
+    zero capacity so the user's queue is never dropped.
+    """
+    by_name = {p.name: p for p in partitions}
+    for job in jobs:
+        for pname in job.partition.split(","):
+            pname = pname.strip()
+            if not pname:
+                continue
+            p = by_name.get(pname)
+            if p is None:
+                p = by_name[pname] = Partition(name=pname)
+                partitions.append(p)
+            if job.bucket == "running":
+                p.my_running += 1
+            elif job.bucket == "pending":
+                p.my_pending += 1
 
 
 # --------------------------------------------------------------------------- #
@@ -360,15 +538,23 @@ def gpu_note(gpus: list[dict]) -> str:
 # --------------------------------------------------------------------------- #
 # Collection
 # --------------------------------------------------------------------------- #
-def _build_squeue_cmd() -> str:
-    return f"squeue --me --noheader -o '{SQUEUE_FORMAT}'"
+def _build_squeue_cmd(with_partitions: bool = False) -> str:
+    squeue = f"squeue --me --noheader -o '{SQUEUE_FORMAT}'"
+    if not with_partitions:
+        return squeue
+    # Same single SSH round-trip: emit jobs, a sentinel, then partition
+    # capacity. ``exit $rc`` propagates squeue's status so a squeue failure is
+    # still surfaced, while a missing/failing sinfo only loses capacity data.
+    sinfo = f"sinfo -h -N -O '{SINFO_FORMAT}'"
+    return (f"{squeue}; rc=$?; echo '{SINFO_SENTINEL}'; "
+            f"{sinfo} 2>/dev/null || true; exit $rc")
 
 
-def _collect_host(spec: dict) -> Host:
+def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
     name = spec.get("name", spec.get("ssh") or "host")
     scheduler = spec.get("scheduler", "slurm").lower()
     host = Host(name=name, kind="gpu" if scheduler in ("gpu", "nvidia") else "slurm")
-    remote_cmd = GPU_CMD if host.kind == "gpu" else _build_squeue_cmd()
+    remote_cmd = GPU_CMD if host.kind == "gpu" else _build_squeue_cmd(with_partitions)
 
     if spec.get("local"):
         argv = ["/bin/sh", "-c", remote_cmd]
@@ -416,21 +602,76 @@ def _collect_host(spec: dict) -> Host:
             return host
         host.note = gpu_note(gpus)
         host.jobs = jobs
+        # A GPU is "free" if no compute process is bound to its index.
+        busy = set()
+        for job in jobs:
+            for idx in job.partition.replace("GPU", "").split(","):
+                idx = idx.strip()
+                if idx:
+                    busy.add(idx)
+        host.gpus_total = len(gpus)
+        host.gpus_free = sum(1 for g in gpus if g["index"] not in busy)
     else:
-        host.jobs = parse_squeue_output(proc.stdout)
+        out = proc.stdout
+        if with_partitions and SINFO_SENTINEL in out:
+            squeue_text, sinfo_text = out.split(SINFO_SENTINEL, 1)
+        else:
+            squeue_text, sinfo_text = out, ""
+        host.jobs = parse_squeue_output(squeue_text)
+        if with_partitions:
+            partitions, totals = parse_sinfo_output(sinfo_text)
+            _fold_my_jobs(partitions, host.jobs)
+            host.partitions = partitions
+            host.cpus_free = totals["cpus_free"]
+            host.cpus_total = totals["cpus_total"]
+            host.gpus_free = totals["gpus_free"]
+            host.gpus_total = totals["gpus_total"]
     return host
 
 
-def collect(config: dict, max_workers: Optional[int] = None) -> Snapshot:
-    """Poll every host in ``config`` concurrently and return a Snapshot."""
+def collect(config: dict, max_workers: Optional[int] = None,
+            with_partitions: bool = False) -> Snapshot:
+    """Poll every host in ``config`` concurrently and return a Snapshot.
+
+    Set ``with_partitions`` to also query ``sinfo`` for per-partition capacity
+    (used by the agent overview). The live TUI leaves it off to stay light.
+    """
     hosts_cfg = config.get("hosts", [])
     workers = max_workers or max(1, len(hosts_cfg))
     results: list[Host] = []
     if hosts_cfg:
+        worker = partial(_collect_host, with_partitions=with_partitions)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             # Preserve config order in the output.
-            results = list(pool.map(_collect_host, hosts_cfg))
+            results = list(pool.map(worker, hosts_cfg))
     return Snapshot(generated_at=time.time(), hosts=results)
+
+
+def build_overview(snapshot: Snapshot) -> dict:
+    """Reshape a Snapshot into the agent-facing capacity overview.
+
+    Answers "what's queued/running and what's free, per cluster and
+    partition" in a compact JSON-ready dict.
+    """
+    clusters = []
+    for h in snapshot.hosts:
+        clusters.append({
+            "name": h.name,
+            "ok": h.ok,
+            "error": h.error,
+            "kind": h.kind,
+            "my_jobs": {"running": h.running, "pending": h.pending},
+            "free": {"cpus": h.cpus_free, "gpus": h.gpus_free},
+            "capacity": {"cpus": h.cpus_total, "gpus": h.gpus_total},
+            "partitions": [p.to_dict() for p in h.partitions],
+        })
+    return {"generated_at": snapshot.generated_at, "clusters": clusters}
+
+
+def collect_overview(config: dict, max_workers: Optional[int] = None) -> dict:
+    """Collect a capacity overview (jobs + free CPUs/GPUs) for every cluster."""
+    snapshot = collect(config, max_workers=max_workers, with_partitions=True)
+    return build_overview(snapshot)
 
 
 # --------------------------------------------------------------------------- #
