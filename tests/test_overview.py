@@ -8,12 +8,12 @@ import types
 
 import pytest
 
-from core import collector
-from core.collector import (
+from cluster_job_monitor import collector
+from cluster_job_monitor.collector import (
     Host, Job, Partition, Snapshot, build_overview, collect, collect_overview,
     parse_sinfo_output,
 )
-from core.collector import _fold_my_jobs, _norm_node_state
+from cluster_job_monitor.collector import _fold_my_jobs, _norm_node_state
 
 
 # --------------------------------------------------------------------------- #

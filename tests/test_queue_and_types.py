@@ -6,8 +6,8 @@ import types
 
 import pytest
 
-from core import collector
-from core.collector import (
+from cluster_job_monitor import collector
+from cluster_job_monitor.collector import (
     Partition, _human_duration, build_overview, collect_overview,
     parse_gpus_by_type, parse_job_line, parse_queue_output, parse_sinfo_output,
 )
@@ -91,7 +91,7 @@ def test_default_partition_marker_stripped_and_matches():
     p = parts[0]
     assert p.name == "capacity" and p.is_default is True
     assert p.to_dict()["is_default"] is True
-    from core.collector import _fold_queue, _fold_my_jobs, Job
+    from cluster_job_monitor.collector import _fold_queue, _fold_my_jobs, Job
     _fold_queue(parts, parse_queue_output("capacity|PENDING|1:00:00\n"))
     assert p.queue_pending == 1  # "capacity" (queue) matched "capacity" (cleaned)
     _fold_my_jobs(parts, [Job(jobid="1", name="n", state="PENDING",

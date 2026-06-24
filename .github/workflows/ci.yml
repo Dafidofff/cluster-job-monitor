@@ -23,8 +23,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+      - name: Install package (with dev + mcp extras)
+        run: pip install -e ".[dev,mcp]"
 
       - name: Run tests with coverage
         run: pytest --cov --cov-report=xml --cov-report=term-missing

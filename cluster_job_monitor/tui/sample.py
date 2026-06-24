@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from core.collector import Host, Job, Partition, Snapshot
+from cluster_job_monitor.collector import Host, Job, Partition, Snapshot
 
 
 def _job(jobid, name, state, part, elapsed, limit, nodes, cpus, gpus,

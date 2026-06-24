@@ -8,8 +8,8 @@ import types
 
 import pytest
 
-from core import collector
-from core.collector import (
+from cluster_job_monitor import collector
+from cluster_job_monitor.collector import (
     Host, Job, Snapshot, collect, gpu_note, gpu_run_label, load_config,
     parse_gpus, parse_gpu_output, parse_job_line, parse_slurm_time,
     parse_squeue_output,

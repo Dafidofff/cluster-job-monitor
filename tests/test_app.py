@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from tui.app import JobMonitorApp, _cycle
-from tui.sample import make_demo_snapshot
+from cluster_job_monitor.tui.app import JobMonitorApp, _cycle
+from cluster_job_monitor.tui.sample import make_demo_snapshot
 
 
 def test_cycle_helper():
