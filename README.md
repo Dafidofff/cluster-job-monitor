@@ -9,6 +9,12 @@ A read-only terminal dashboard that shows your SLURM jobs across several
 clusters **and** your desktop in one view. It SSHes into each host, runs
 `squeue --me`, and renders a live, colour-coded overview.
 
+**For coding agents:** one `--overview` call (CLI **or** [MCP](#agent-overview))
+returns, per cluster *and* partition, how many CPUs/GPUs are free — broken down
+by GPU type, with the largest free block on a single node — plus your
+queued/running jobs and an approximate queueing time. See
+[Agent overview](#agent-overview).
+
 **Read-only by design:** the only commands ever run are `squeue` and `sinfo`
 (SLURM hosts) and `nvidia-smi` + `ps` (non-SLURM GPU hosts). There is no code
 path that can cancel or submit jobs. It uses *your* existing SSH config and
@@ -23,6 +29,14 @@ keys — nothing new is exposed, no server, no stored secrets.
 ╰────────────────────────────────────────────────────────────────────────────╯
   2 ▸ ● Hipster   4 run  7 pend   192 cpu  14 gpu        (press 2 to expand)
 ```
+
+## Contents
+
+- [Quick look (no clusters needed)](#quick-look-no-clusters-needed) — try it with synthetic data
+- [Real setup](#real-setup) — point it at your clusters
+- [Agent overview](#agent-overview) — free CPUs/GPUs, GPU types, queue times (CLI + MCP)
+- [Keys](#keys) — TUI keybindings
+- [Layout](#layout) · [Development](#development) · [License](#license)
 
 ## Quick look (no clusters needed)
 
@@ -81,7 +95,7 @@ python run.py --once --demo   # print one synthetic snapshot and exit
    python run.py --config ~/my-clusters.json
    ```
 
-## Agent overview (capacity, per cluster & partition)
+## Agent overview
 
 For coding agents (or scripts) that need to decide *where* to launch a job,
 there's a one-shot overview that answers, in a single call:
