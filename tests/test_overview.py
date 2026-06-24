@@ -147,8 +147,10 @@ def test_partition_to_dict_shape():
     d = p.to_dict()
     assert d["name"] == "gpu" and d["my_running"] == 1 and d["my_pending"] == 2
     assert d["cpus"] == {"free": 10, "alloc": 6, "total": 16}
-    assert d["gpus"] == {"free": 2, "alloc": 1, "total": 4}
+    assert d["gpus"]["free"] == 2 and d["gpus"]["alloc"] == 1 and d["gpus"]["total"] == 4
+    assert d["gpus"]["by_type"] == {} and d["gpus"]["max_free_per_node"] == 0
     assert d["nodes"]["idle"] == 1 and d["nodes"]["total"] == 1
+    assert d["queue"]["wait_estimate"] == "immediate"  # free GPUs > 0
 
 
 def test_host_to_dict_has_capacity_and_partitions():

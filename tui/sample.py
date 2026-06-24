@@ -8,11 +8,11 @@ from core.collector import Host, Job, Partition, Snapshot
 
 
 def _job(jobid, name, state, part, elapsed, limit, nodes, cpus, gpus,
-         reason="", progress=None):
+         reason="", progress=None, start_time=""):
     return Job(
         jobid=jobid, name=name, state=state, partition=part, elapsed=elapsed,
         time_limit=limit, nodes=nodes, cpus=cpus, gpus=gpus, reason=reason,
-        submit_time="2026-06-17T09:00:00", progress=progress,
+        submit_time="2026-06-17T09:00:00", progress=progress, start_time=start_time,
     )
 
 
@@ -23,20 +23,27 @@ def make_demo_snapshot(_config=None) -> Snapshot:
         partitions=[
             Partition(name="gpu_a100", cpus_free=96, cpus_alloc=416, cpus_total=512,
                       gpus_free=4, gpus_alloc=28, gpus_total=32,
+                      gpus_by_type={"a100": {"free": 4, "alloc": 28, "total": 32}},
+                      gpus_max_free_node=2,
                       nodes_idle=0, nodes_mixed=6, nodes_alloc=2, nodes_total=8,
-                      my_running=1, my_pending=2),
-            Partition(name="gpu", cpus_free=128, cpus_alloc=128, cpus_total=256,
+                      my_running=1, my_pending=2,
+                      queue_pending=11, queue_running=8, soonest_free_sec=9300),
+            Partition(name="gpu_h100", cpus_free=128, cpus_alloc=128, cpus_total=256,
                       gpus_free=10, gpus_alloc=6, gpus_total=16,
+                      gpus_by_type={"h100": {"free": 10, "alloc": 6, "total": 16}},
+                      gpus_max_free_node=4,
                       nodes_idle=2, nodes_mixed=2, nodes_total=4,
-                      my_running=1, my_pending=0),
+                      my_running=1, my_pending=0,
+                      queue_pending=0, queue_running=2, soonest_free_sec=1800),
         ],
         jobs=[
             _job("8123456", "diffusion-pretrain", "RUNNING", "gpu_a100",
                  "1-04:12:00", "5-00:00:00", 2, 36, 8, progress=0.23),
-            _job("8123457", "ablation-lr3e4", "RUNNING", "gpu",
+            _job("8123457", "ablation-lr3e4", "RUNNING", "gpu_h100",
                  "18:42:10", "1-00:00:00", 1, 18, 4, progress=0.78),
             _job("8123460", "sweep-seed-7", "PENDING", "gpu_a100",
-                 "0:00", "1-00:00:00", 1, 18, 4, reason="Priority"),
+                 "0:00", "1-00:00:00", 1, 18, 4, reason="Priority",
+                 start_time="2026-06-21T18:30:00"),
             _job("8123461", "sweep-seed-8", "PENDING", "gpu_a100",
                  "0:00", "1-00:00:00", 1, 18, 4, reason="Resources"),
         ],
@@ -47,8 +54,11 @@ def make_demo_snapshot(_config=None) -> Snapshot:
         partitions=[
             Partition(name="defq", cpus_free=200, cpus_alloc=56, cpus_total=256,
                       gpus_free=12, gpus_alloc=4, gpus_total=16,
+                      gpus_by_type={"rtx4090": {"free": 12, "alloc": 4, "total": 16}},
+                      gpus_max_free_node=4,
                       nodes_idle=3, nodes_mixed=1, nodes_other=1, nodes_total=5,
-                      my_running=1, my_pending=0),
+                      my_running=1, my_pending=0,
+                      queue_pending=0, queue_running=4, soonest_free_sec=600),
         ],
         jobs=[
             _job("44219", "eval-medmnist", "RUNNING", "defq",

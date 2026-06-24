@@ -273,18 +273,47 @@ def _free_cell(free: int, total: int) -> Text:
     return t
 
 
+def _gpu_types_cell(gpus: dict) -> Text:
+    """Per-type free GPUs, e.g. 'a100:4 h100:6'. Names the GPU even when there's
+    just one type (knowing it's a100 vs h100 matters)."""
+    by_type = gpus.get("by_type") or {}
+    typed = [(k, v) for k, v in by_type.items() if v.get("total", 0) > 0]
+    if not typed:
+        return Text("—", style="dim")
+    t = Text()
+    for i, (typ, v) in enumerate(sorted(typed)):
+        if i:
+            t.append(" ")
+        free = v.get("free", 0)
+        t.append(f"{typ}:", style="grey62")
+        t.append(str(free), style="green" if free else "red")
+    return t
+
+
+def _wait_cell(queue: dict) -> Text:
+    """Colour the wait estimate: immediate=green, an estimate=yellow, else dim."""
+    est = (queue or {}).get("wait_estimate", "unknown")
+    if est == "immediate":
+        return Text("immediate", style="bold green")
+    if est == "unknown":
+        return Text("—", style="dim")
+    return Text(est, style="yellow")
+
+
 def _partitions_table(partitions: list[dict]) -> Table:
     table = Table(
         box=None, expand=True, pad_edge=False, show_edge=False,
         header_style="dim", padding=(0, 1),
     )
     table.add_column("PARTITION", style="grey70", no_wrap=True)
-    table.add_column("CPUS FREE", no_wrap=True)
     table.add_column("GPUS FREE", no_wrap=True)
-    table.add_column("NODES (idle/mix/alloc)", style="grey50", no_wrap=True)
+    table.add_column("BY TYPE", no_wrap=True)
+    table.add_column("1-NODE", no_wrap=True, justify="right")
+    table.add_column("CPUS FREE", no_wrap=True)
+    table.add_column("WAIT", no_wrap=True)
     table.add_column("MY JOBS", no_wrap=True)
     for p in partitions:
-        cpus, gpus, nodes = p["cpus"], p["gpus"], p["nodes"]
+        cpus, gpus = p["cpus"], p["gpus"]
         mine = Text()
         if p["my_running"]:
             mine.append(f"{p['my_running']} run", style="green")
@@ -294,14 +323,34 @@ def _partitions_table(partitions: list[dict]) -> Table:
             mine.append(f"{p['my_pending']} pend", style="yellow")
         if not mine:
             mine.append("—", style="dim")
+        pocket = gpus.get("max_free_per_node", 0)
         table.add_row(
             p["name"],
-            _free_cell(cpus["free"], cpus["total"]),
             _free_cell(gpus["free"], gpus["total"]),
-            f"{nodes['idle']}/{nodes['mixed']}/{nodes['alloc']}",
+            _gpu_types_cell(gpus),
+            (Text(str(pocket), style="cyan") if pocket else Text("—", style="dim")),
+            _free_cell(cpus["free"], cpus["total"]),
+            _wait_cell(p.get("queue")),
             mine,
         )
     return table
+
+
+def _pending_eta_text(my_pending: list[dict]) -> Optional[Text]:
+    """One line listing your pending jobs and SLURM's estimated start, if any."""
+    with_eta = [j for j in (my_pending or []) if j.get("est_start")]
+    if not with_eta:
+        return None
+    t = Text()
+    t.append("pending ETA: ", style="dim")
+    for i, j in enumerate(with_eta[:4]):
+        if i:
+            t.append("  ")
+        t.append(f"{j['name']}", style="yellow")
+        t.append(f" → {j['est_start']}", style="grey62")
+    if len(with_eta) > 4:
+        t.append(f"  (+{len(with_eta) - 4} more)", style="dim")
+    return t
 
 
 def render_overview(overview: dict) -> RenderableType:
@@ -329,7 +378,9 @@ def render_overview(overview: dict) -> RenderableType:
         if not c["ok"]:
             body: RenderableType = Text(f"unreachable — {c['error']}", style="red")
         elif c["partitions"]:
-            body = _partitions_table(c["partitions"])
+            table = _partitions_table(c["partitions"])
+            eta = _pending_eta_text(c.get("my_pending_jobs"))
+            body = Group(table, eta) if eta else table
         elif c["kind"] == "gpu":
             body = Text("GPU host — see free/total above", style="dim italic")
         else:
