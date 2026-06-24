@@ -127,6 +127,8 @@ class Partition:
     nodes_alloc: int = 0
     nodes_other: int = 0
     nodes_total: int = 0
+    # True if this is the cluster's default partition (sinfo marks it with '*').
+    is_default: bool = False
     my_running: int = 0
     my_pending: int = 0
     # Cluster-wide queue (all users), for the pre-submission wait estimate.
@@ -171,6 +173,7 @@ class Partition:
                 "by_type": self.gpus_by_type,
                 "max_free_per_node": self.gpus_max_free_node,
             },
+            "is_default": self.is_default,
             "nodes": {
                 "idle": self.nodes_idle,
                 "mixed": self.nodes_mixed,
@@ -428,6 +431,10 @@ def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
         if len(toks) < 6:
             continue
         node, pname, raw_state, cpustate, gres, gres_used = toks[:6]
+        # sinfo flags the default partition with a trailing '*'; squeue does
+        # not, so strip it here to keep partition names matchable.
+        is_default = pname.endswith("*")
+        pname = pname.rstrip("*")
 
         cstate = cpustate.split("/")
         if len(cstate) == 4:
@@ -444,6 +451,8 @@ def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
         p = parts.get(pname)
         if p is None:
             p = parts[pname] = Partition(name=pname)
+        if is_default:
+            p.is_default = True
         p.cpus_free += idle_c
         p.cpus_alloc += alloc_c
         p.cpus_total += total_c

@@ -124,6 +124,7 @@ read-only). All of it is folded into the **same SSH round-trip** as
             "by_type": { "a100": { "free": 0, "alloc": 32, "total": 32 } },
             "max_free_per_node": 0
           },
+          "is_default": false,
           "nodes": { "idle": 0, "mixed": 0, "alloc": 8, "other": 0, "total": 8 },
           "queue": {
             "pending": 11, "running": 8,
@@ -143,7 +144,8 @@ Notes:
   nodes (idle/mixed/allocated). `max_free_per_node` tells you whether a
   multi-GPU job fits on one node.
 - A node shared between partitions counts toward each partition's tally but is
-  counted **once** in the cluster-level `free`/`capacity` totals.
+  counted **once** in the cluster-level `free`/`capacity` totals. `is_default`
+  flags the partition that untargeted (`sbatch` without `-p`) jobs land on.
 - `my_running`/`my_pending` and `my_pending_jobs[].est_start` come from
   `squeue --me` (`est_start` is SLURM's backfill estimate, `null` until it's
   computed). The per-partition `queue` block comes from a cluster-wide `squeue`

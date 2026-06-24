@@ -84,6 +84,22 @@ def test_parse_queue_output_multi_partition_pending():
     assert stats["gpu"]["pending"] == 1 and stats["gpu_a100"]["pending"] == 1
 
 
+def test_default_partition_marker_stripped_and_matches():
+    # sinfo marks the default partition with '*'; the name must be cleaned so
+    # squeue-derived my-jobs and queue stats fold onto it.
+    parts, _ = parse_sinfo_output("node01 capacity* idle 0/64/0/64 gpu:l4:8 gpu:l4:0\n")
+    p = parts[0]
+    assert p.name == "capacity" and p.is_default is True
+    assert p.to_dict()["is_default"] is True
+    from core.collector import _fold_queue, _fold_my_jobs, Job
+    _fold_queue(parts, parse_queue_output("capacity|PENDING|1:00:00\n"))
+    assert p.queue_pending == 1  # "capacity" (queue) matched "capacity" (cleaned)
+    _fold_my_jobs(parts, [Job(jobid="1", name="n", state="PENDING",
+                              partition="capacity", elapsed="0", time_limit="",
+                              nodes=1, cpus=1, gpus=0, reason="", submit_time="")])
+    assert p.my_pending == 1
+
+
 # --------------------------------------------------------------------------- #
 # wait estimate
 # --------------------------------------------------------------------------- #
