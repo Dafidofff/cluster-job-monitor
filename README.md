@@ -32,25 +32,40 @@ keys — nothing new is exposed, no server, no stored secrets.
 
 ## Contents
 
+- [Install](#install) — `pip install cluster-job-monitor`
 - [Quick look (no clusters needed)](#quick-look-no-clusters-needed) — try it with synthetic data
 - [Real setup](#real-setup) — point it at your clusters
 - [Agent overview](#agent-overview) — free CPUs/GPUs, GPU types, queue times (CLI + MCP)
 - [Keys](#keys) — TUI keybindings
 - [Layout](#layout) · [Development](#development) · [License](#license)
 
-## Quick look (no clusters needed)
+## Install
+
+```bash
+pip install cluster-job-monitor            # the dashboard + CLI
+pip install "cluster-job-monitor[mcp]"     # also the MCP server (see below)
+```
+
+This installs the `cluster-jobs` command. Prefer a virtualenv:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install cluster-job-monitor
+```
 
 > If `pip install` fails with an SSL / "ssl module is not available" error,
 > your default `python3` was built without OpenSSL. Use Homebrew's instead:
 > `/opt/homebrew/bin/python3 -m venv .venv`.
 
-```bash
-git clone git@github.com:Dafidofff/cluster-job-monitor.git && cd cluster-job-monitor
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+Working from a checkout instead? `pip install -e ".[mcp,dev]"` and use
+`cluster-jobs`. The legacy entrypoints `python run.py …` and
+`python mcp_server.py` still work as thin shims.
 
-python run.py --demo          # live TUI with synthetic data
-python run.py --once --demo   # print one synthetic snapshot and exit
+## Quick look (no clusters needed)
+
+```bash
+cluster-jobs --demo          # live TUI with synthetic data
+cluster-jobs --once --demo   # print one synthetic snapshot and exit
 ```
 
 ## Real setup
@@ -91,9 +106,11 @@ python run.py --once --demo   # print one synthetic snapshot and exit
 3. **Run it:**
 
    ```bash
-   python run.py                 # uses ./clusters.json
-   python run.py --config ~/my-clusters.json
+   cluster-jobs                 # uses ./clusters.json
+   cluster-jobs --config ~/my-clusters.json
    ```
+
+   (`python run.py …` still works from a checkout.)
 
 ## Agent overview
 
@@ -107,9 +124,9 @@ there's a one-shot overview that answers, in a single call:
   jobs, plus a per-partition pre-submission wait estimate.
 
 ```bash
-python run.py --overview          # human-readable capacity table
-python run.py --overview --json   # machine-readable JSON (for agents)
-python run.py --overview --demo --json   # try it with synthetic data
+cluster-jobs --overview          # human-readable capacity table
+cluster-jobs --overview --json   # machine-readable JSON (for agents)
+cluster-jobs --overview --demo --json   # try it with synthetic data
 ```
 
 This is the only place the tool runs `sinfo` and a cluster-wide `squeue` (still
@@ -175,9 +192,15 @@ The same overview is exposed over MCP so an agent can call it natively, via a
 thin wrapper that adds no new cluster access:
 
 ```bash
-pip install -r requirements-mcp.txt        # installs the MCP SDK
+pip install "cluster-job-monitor[mcp]"     # installs the MCP SDK
 
-# Register with Claude Code (point CLUSTER_MONITOR_CONFIG at your config):
+# Register with Claude Code (point CLUSTER_MONITOR_CONFIG at your config).
+# Installed:
+claude mcp add cluster-monitor \
+  -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
+  -- python -m cluster_job_monitor.mcp_server
+
+# Or, from a checkout, the legacy shim still works:
 claude mcp add cluster-monitor \
   -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
   -- python /abs/path/to/mcp_server.py
@@ -213,25 +236,31 @@ Auto-refresh interval is `refresh_seconds` in the config (default 30).
 ## Layout
 
 ```
-cluster-jobs/
-  run.py                 # entry point (--once, --overview, --json, --demo, --config)
-  core/collector.py      # UI-agnostic: SSH + squeue/sinfo -> Snapshot dataclasses
-  mcp_server.py          # MCP wrapper exposing the capacity overview to agents
-  tui/app.py             # Textual app (live loop, filters, keybindings)
-  tui/render.py          # Rich renderables (shared by TUI, --once, --overview)
-  tui/sample.py          # synthetic snapshot for --demo
-  clusters.example.json  # config template (copy to clusters.json)
+cluster-job-monitor/
+  cluster_job_monitor/        # the import package (pip-installable)
+    __init__.py               # public API: Job, Host, Partition, Snapshot, collect, …
+    cli.py                    # entry point (--once, --overview, --json, --demo, --config)
+    collector.py              # UI-agnostic: SSH + squeue/sinfo -> Snapshot dataclasses
+    mcp_server.py             # MCP wrapper exposing the capacity overview to agents
+    tui/app.py                # Textual app (live loop, filters, keybindings)
+    tui/render.py             # Rich renderables (shared by TUI, --once, --overview)
+    tui/sample.py             # synthetic snapshot for --demo
+  run.py                      # back-compat shim -> cluster_job_monitor.cli:main
+  mcp_server.py               # back-compat shim -> cluster_job_monitor.mcp_server:main
+  clusters.example.json       # config template (copy to clusters.json)
+  pyproject.toml              # packaging (hatchling) + pytest/coverage config
 ```
 
-`core/collector.py` has **no third-party dependencies** and returns a
-`Snapshot` whose `.to_dict()` is JSON-ready — that's the seam for a future
-web/phone dashboard (push the dict to an authenticated endpoint and render it
-in a browser), without changing the collector.
+`cluster_job_monitor/collector.py` has **no third-party dependencies** and
+returns a `Snapshot` whose `.to_dict()` is JSON-ready — that's the seam for a
+future web/phone dashboard (push the dict to an authenticated endpoint and
+render it in a browser), without changing the collector. Import it directly:
+`from cluster_job_monitor import collect, build_overview, load_config`.
 
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -e ".[dev,mcp]"  # editable install with test + MCP deps
 pytest                       # run the suite
 pytest --cov --cov-report=term-missing   # with coverage (~94%)
 ```

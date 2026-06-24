@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static
 
-from core.collector import Snapshot, collect
+from cluster_job_monitor.collector import Snapshot, collect
 from .render import (
     Filters, all_hosts, all_partitions, render_body, render_header,
 )

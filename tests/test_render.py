@@ -6,9 +6,9 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.text import Text
 
-from core.collector import Host, Job, Snapshot
-from tui import render
-from tui.render import (
+from cluster_job_monitor.collector import Host, Job, Snapshot
+from cluster_job_monitor.tui import render
+from cluster_job_monitor.tui.render import (
     Filters, all_hosts, all_partitions, render_body, render_header,
 )
 

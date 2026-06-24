@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from core.collector import Host, Job, Snapshot
+from cluster_job_monitor.collector import Host, Job, Snapshot
 
 # Bucket -> (label colour, chip style)
 _STATE_STYLE = {

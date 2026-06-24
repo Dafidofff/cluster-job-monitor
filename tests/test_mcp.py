@@ -10,8 +10,8 @@ from unittest import mock
 
 import pytest
 
-import mcp_server
-from core.collector import Host, Partition, Snapshot
+from cluster_job_monitor import mcp_server
+from cluster_job_monitor.collector import Host, Partition, Snapshot
 
 
 def test_cluster_overview_missing_config(monkeypatch):
@@ -33,7 +33,7 @@ def test_cluster_overview_success(monkeypatch):
                                    gpus_free=2, gpus_total=4, my_running=1)]),
     ])
     monkeypatch.setattr(mcp_server, "_load", lambda: {"hosts": []})
-    monkeypatch.setattr("core.collector.collect", lambda *a, **k: snap)
+    monkeypatch.setattr("cluster_job_monitor.collector.collect", lambda *a, **k: snap)
     out = mcp_server.cluster_overview()
     assert out["clusters"][0]["name"] == "C"
     assert out["clusters"][0]["free"] == {"cpus": 10, "gpus": 2}
