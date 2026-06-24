@@ -14,6 +14,31 @@ def test_once_demo(monkeypatch, capsys):
     assert "CLUSTER JOBS" in out and "Larry" in out
 
 
+def test_once_demo_json(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["run.py", "--once", "--demo", "--json"])
+    assert run.main() == 0
+    data = json.loads(capsys.readouterr().out)
+    assert "hosts" in data and data["totals"]["running"] >= 1
+
+
+def test_overview_demo_json(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["run.py", "--overview", "--demo", "--json"])
+    assert run.main() == 0
+    data = json.loads(capsys.readouterr().out)
+    names = [c["name"] for c in data["clusters"]]
+    assert "Snellius" in names
+    snellius = next(c for c in data["clusters"] if c["name"] == "Snellius")
+    assert snellius["free"]["gpus"] == 14
+    assert snellius["partitions"][0]["name"] == "gpu_a100"
+
+
+def test_overview_demo_table(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["run.py", "--overview", "--demo"])
+    assert run.main() == 0
+    out = capsys.readouterr().out
+    assert "Snellius" in out and "PARTITION" in out and "gpu_a100" in out
+
+
 def test_once_real_config(monkeypatch, capsys, tmp_path):
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"hosts": [

@@ -255,3 +255,140 @@ def all_hosts(snapshot: Optional[Snapshot]) -> list[str]:
     if snapshot is None:
         return []
     return [h.name for h in snapshot.hosts]
+
+
+# --------------------------------------------------------------------------- #
+# Capacity overview (human view of build_overview())
+# --------------------------------------------------------------------------- #
+def _free_cell(free: int, total: int) -> Text:
+    """Colour a free/total figure green→yellow→red as it fills up."""
+    t = Text()
+    if total <= 0:
+        t.append("—", style="dim")
+        return t
+    frac_free = free / total
+    style = "bold green" if frac_free >= 0.34 else "bold yellow" if frac_free > 0 else "bold red"
+    t.append(str(free), style=style)
+    t.append(f"/{total}", style="grey50")
+    return t
+
+
+def _gpu_types_cell(gpus: dict) -> Text:
+    """Per-type free GPUs, e.g. 'a100:4 h100:6'. Names the GPU even when there's
+    just one type (knowing it's a100 vs h100 matters)."""
+    by_type = gpus.get("by_type") or {}
+    typed = [(k, v) for k, v in by_type.items() if v.get("total", 0) > 0]
+    if not typed:
+        return Text("—", style="dim")
+    t = Text()
+    for i, (typ, v) in enumerate(sorted(typed)):
+        if i:
+            t.append(" ")
+        free = v.get("free", 0)
+        t.append(f"{typ}:", style="grey62")
+        t.append(str(free), style="green" if free else "red")
+    return t
+
+
+def _wait_cell(queue: dict) -> Text:
+    """Colour the wait estimate: immediate=green, an estimate=yellow, else dim."""
+    est = (queue or {}).get("wait_estimate", "unknown")
+    if est == "immediate":
+        return Text("immediate", style="bold green")
+    if est == "unknown":
+        return Text("—", style="dim")
+    return Text(est, style="yellow")
+
+
+def _partitions_table(partitions: list[dict]) -> Table:
+    table = Table(
+        box=None, expand=True, pad_edge=False, show_edge=False,
+        header_style="dim", padding=(0, 1),
+    )
+    table.add_column("PARTITION", style="grey70", no_wrap=True)
+    table.add_column("GPUS FREE", no_wrap=True)
+    table.add_column("BY TYPE", no_wrap=True)
+    table.add_column("1-NODE", no_wrap=True, justify="right")
+    table.add_column("CPUS FREE", no_wrap=True)
+    table.add_column("WAIT", no_wrap=True)
+    table.add_column("MY JOBS", no_wrap=True)
+    for p in partitions:
+        cpus, gpus = p["cpus"], p["gpus"]
+        mine = Text()
+        if p["my_running"]:
+            mine.append(f"{p['my_running']} run", style="green")
+        if p["my_pending"]:
+            if mine:
+                mine.append(" ")
+            mine.append(f"{p['my_pending']} pend", style="yellow")
+        if not mine:
+            mine.append("—", style="dim")
+        pocket = gpus.get("max_free_per_node", 0)
+        table.add_row(
+            p["name"],
+            _free_cell(gpus["free"], gpus["total"]),
+            _gpu_types_cell(gpus),
+            (Text(str(pocket), style="cyan") if pocket else Text("—", style="dim")),
+            _free_cell(cpus["free"], cpus["total"]),
+            _wait_cell(p.get("queue")),
+            mine,
+        )
+    return table
+
+
+def _pending_eta_text(my_pending: list[dict]) -> Optional[Text]:
+    """One line listing your pending jobs and SLURM's estimated start, if any."""
+    with_eta = [j for j in (my_pending or []) if j.get("est_start")]
+    if not with_eta:
+        return None
+    t = Text()
+    t.append("pending ETA: ", style="dim")
+    for i, j in enumerate(with_eta[:4]):
+        if i:
+            t.append("  ")
+        t.append(f"{j['name']}", style="yellow")
+        t.append(f" → {j['est_start']}", style="grey62")
+    if len(with_eta) > 4:
+        t.append(f"  (+{len(with_eta) - 4} more)", style="dim")
+    return t
+
+
+def render_overview(overview: dict) -> RenderableType:
+    """Render build_overview() output as one panel per cluster."""
+    clusters = overview.get("clusters", [])
+    if not clusters:
+        return Text("\n  No clusters configured.", style="dim")
+    items: list[RenderableType] = []
+    for c in clusters:
+        title = Text()
+        title.append(f"{_DOT} ", style="green" if c["ok"] else "red")
+        title.append(c["name"], style="bold")
+
+        subtitle = Text()
+        free, cap = c["free"], c["capacity"]
+        subtitle.append("free ", style="dim")
+        subtitle.append_text(_free_cell(free["cpus"], cap["cpus"]))
+        subtitle.append(" cpu  ", style="grey50")
+        subtitle.append_text(_free_cell(free["gpus"], cap["gpus"]))
+        subtitle.append(" gpu", style="grey50")
+        jobs = c["my_jobs"]
+        subtitle.append(f"   {jobs['running']} run", style="green")
+        subtitle.append(f"  {jobs['pending']} pend", style="yellow")
+
+        if not c["ok"]:
+            body: RenderableType = Text(f"unreachable — {c['error']}", style="red")
+        elif c["partitions"]:
+            table = _partitions_table(c["partitions"])
+            eta = _pending_eta_text(c.get("my_pending_jobs"))
+            body = Group(table, eta) if eta else table
+        elif c["kind"] == "gpu":
+            body = Text("GPU host — see free/total above", style="dim italic")
+        else:
+            body = Text("no partition data (sinfo unavailable?)", style="dim italic")
+
+        items.append(Panel(
+            body, title=title, subtitle=subtitle, subtitle_align="left",
+            title_align="left", box=ROUNDED,
+            border_style="green" if c["ok"] else "red", padding=(0, 1),
+        ))
+    return Group(*items)
