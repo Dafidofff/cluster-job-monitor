@@ -132,5 +132,5 @@ them on Python 3.10–3.12 and reports coverage to Codecov.
 
 ## License
 
-[MIT](LICENSE) © David Wessels. You're free to use, modify, and redistribute
+[MIT](LICENSE) © David R Wessels. You're free to use, modify, and redistribute
 it; just keep the copyright notice and license text in any copies.
