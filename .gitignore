@@ -13,5 +13,11 @@ venv/
 coverage.xml
 htmlcov/
 
+# MkDocs build output
+site/
+
+# Claude Code agent worktrees / scratch
+.claude/
+
 # macOS
 .DS_Store
