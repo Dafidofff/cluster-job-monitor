@@ -20,15 +20,9 @@ queued/running jobs and an approximate queueing time. See
 path that can cancel or submit jobs. It uses *your* existing SSH config and
 keys — nothing new is exposed, no server, no stored secrets.
 
-```
-┌ CLUSTER JOBS    3 running   2 pending      updated 4s ago      filter: none ┐
+![cluster-jobs live dashboard — colour-coded SLURM jobs across clusters](docs/img/dashboard.svg)
 
-╭ 1 ▾ ● Snellius   2 run  2 pend   54 cpu  12 gpu ───────────────────────────╮
-│ ● 8123456  diffusion-pretrain   gpu_a100  2n 36c 8gpu  ███░░░░░░  23%  Running│
-│ ● 8123460  sweep-seed-7         gpu_a100  1n 18c 4gpu  limit 1-00:00:00  Priority│
-╰────────────────────────────────────────────────────────────────────────────╯
-  2 ▸ ● Hipster   4 run  7 pend   192 cpu  14 gpu        (press 2 to expand)
-```
+*Live TUI with synthetic demo data (`--demo`).*
 
 ## Contents
 
@@ -128,6 +122,10 @@ cluster-jobs --overview          # human-readable capacity table
 cluster-jobs --overview --json   # machine-readable JSON (for agents)
 cluster-jobs --overview --demo --json   # try it with synthetic data
 ```
+
+![cluster-jobs capacity overview — free CPUs/GPUs per cluster and partition](docs/img/overview.svg)
+
+*`cluster-jobs --overview` (synthetic data).*
 
 This is the only place the tool runs `sinfo` and a cluster-wide `squeue` (still
 read-only). All of it is folded into the **same SSH round-trip** as
