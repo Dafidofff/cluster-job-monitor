@@ -1,0 +1,2 @@
+# Documentation site dependencies (MkDocs + Material theme).
+mkdocs-material

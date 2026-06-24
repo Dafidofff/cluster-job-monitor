@@ -5,6 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
+📖 **[Documentation](https://dafidofff.github.io/cluster-job-monitor/)** — the
+extended reference (configuration, agent overview, MCP, development).
+
 A read-only terminal dashboard that shows your SLURM jobs across several
 clusters **and** your desktop in one view. It SSHes into each host, runs
 `squeue --me`, and renders a live, colour-coded overview.

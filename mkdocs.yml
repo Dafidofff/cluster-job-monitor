@@ -1,0 +1,44 @@
+site_name: cluster-job-monitor
+site_description: A read-only terminal dashboard for your SLURM jobs across clusters, with a one-shot capacity overview for coding agents.
+site_url: https://dafidofff.github.io/cluster-job-monitor/
+repo_url: https://github.com/Dafidofff/cluster-job-monitor
+repo_name: Dafidofff/cluster-job-monitor
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Quick start: quickstart.md
+  - Configuration: configuration.md
+  - Agent overview: agent-overview.md
+  - MCP: mcp.md
+  - Development: development.md
