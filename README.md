@@ -195,17 +195,15 @@ thin wrapper that adds no new cluster access:
 ```bash
 pip install "cluster-job-monitor[mcp]"     # installs the MCP SDK
 
-# Register with Claude Code (point CLUSTER_MONITOR_CONFIG at your config).
-# Installed:
+# Register with Claude Code (point CLUSTER_MONITOR_CONFIG at your config):
 claude mcp add cluster-monitor \
   -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
-  -- python -m cluster_job_monitor.mcp_server
-
-# Or, from a checkout, the legacy shim still works:
-claude mcp add cluster-monitor \
-  -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
-  -- python /abs/path/to/mcp_server.py
+  -- cluster-jobs-mcp
 ```
+
+(`cluster-jobs-mcp` is installed with the `[mcp]` extra. Equivalents:
+`python -m cluster_job_monitor.mcp_server`, or `python /abs/path/to/mcp_server.py`
+from a source checkout.)
 
 It serves two tools:
 

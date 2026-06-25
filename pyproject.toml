@@ -30,6 +30,7 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov>=5"]
 
 [project.scripts]
 cluster-jobs = "cluster_job_monitor.cli:main"
+cluster-jobs-mcp = "cluster_job_monitor.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/Dafidofff/cluster-job-monitor"

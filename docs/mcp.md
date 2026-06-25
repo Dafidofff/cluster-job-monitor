@@ -23,16 +23,17 @@ Point `CLUSTER_MONITOR_CONFIG` at your config (otherwise the server uses
 ```bash
 claude mcp add cluster-monitor \
   -e CLUSTER_MONITOR_CONFIG=/abs/path/to/clusters.json \
-  -- python -m cluster_job_monitor.mcp_server
+  -- cluster-jobs-mcp
 ```
 
 The server speaks the stdio transport, so you can also run it directly to test:
 
 ```bash
-python -m cluster_job_monitor.mcp_server
+cluster-jobs-mcp
 ```
 
-(From a source checkout, `python mcp_server.py` is an equivalent shim.)
+(Equivalent invocations: `python -m cluster_job_monitor.mcp_server`, or
+`python mcp_server.py` from a source checkout.)
 
 ## Tools
 
