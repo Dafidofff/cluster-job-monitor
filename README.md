@@ -126,10 +126,6 @@ cluster-jobs --overview --json   # machine-readable JSON (for agents)
 cluster-jobs --overview --demo --json   # try it with synthetic data
 ```
 
-![cluster-jobs capacity overview — free CPUs/GPUs per cluster and partition](docs/img/overview.svg)
-
-*`cluster-jobs --overview` (synthetic data).*
-
 This is the only place the tool runs `sinfo` and a cluster-wide `squeue` (still
 read-only). All of it is folded into the **same SSH round-trip** as
 `squeue --me`, so an overview is one connection per host. The JSON shape:
