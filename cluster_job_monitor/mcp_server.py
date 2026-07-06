@@ -46,14 +46,24 @@ def _load() -> dict:
 
 
 def cluster_overview() -> dict:
-    """Queued/running jobs and free CPUs/GPUs, per cluster and per partition.
+    """Queued/running jobs, free CPUs/GPUs, and compute budget, per cluster.
 
-    Call this before submitting work to see where there is capacity. For each
-    cluster it returns: your own running/pending job counts, the free and total
-    CPUs/GPUs, and a per-partition breakdown (free/alloc/total CPUs and GPUs,
-    node states, and how many of your jobs sit in each partition).
+    Call this before submitting work to see where there is capacity *and*
+    whether you have budget left to run there. For each cluster it returns:
+    your own running/pending job counts, the free and total CPUs/GPUs, a
+    per-partition breakdown (free/alloc/total CPUs and GPUs, node states, and
+    how many of your jobs sit in each partition), and — for hosts whose config
+    sets an ``"accounting"`` source — a per-account ``budget`` list with
+    granted/used/remaining and a ``unit`` label.
 
-    Read-only: it runs only ``squeue --me`` and ``sinfo`` on each host.
+    Budget ``source`` is either ``"sacctmgr"`` (native SLURM accounting;
+    well-supported; ``granted``/``remaining`` may be null when the site doesn't
+    cap via GrpTRESMins) or ``"budget-overview"`` (a SURF-specific script whose
+    output format is unverified — treat its numbers as best-effort). ``budget``
+    is an empty list for hosts that don't configure accounting.
+
+    Read-only: it runs only ``squeue --me``, ``sinfo``, and (when configured)
+    ``sacctmgr``/``sreport`` or ``budget-overview`` on each host.
     """
     try:
         return collect_overview(_load())
