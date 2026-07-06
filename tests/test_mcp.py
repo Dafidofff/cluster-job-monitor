@@ -11,7 +11,7 @@ from unittest import mock
 import pytest
 
 from cluster_job_monitor import mcp_server
-from cluster_job_monitor.collector import Host, Partition, Snapshot
+from cluster_job_monitor.collector import Budget, Host, Partition, Snapshot
 
 
 def test_cluster_overview_missing_config(monkeypatch):
@@ -38,6 +38,20 @@ def test_cluster_overview_success(monkeypatch):
     assert out["clusters"][0]["name"] == "C"
     assert out["clusters"][0]["free"] == {"cpus": 10, "gpus": 2}
     assert out["clusters"][0]["partitions"][0]["my_running"] == 1
+
+
+def test_cluster_overview_surfaces_budget(monkeypatch):
+    snap = Snapshot(generated_at=1.0, hosts=[
+        Host(name="Snellius", budgets=[
+            Budget(account="prjs0123", source="sacctmgr", unit="core-hours",
+                   granted=1000.0, used=400.0, remaining=600.0)]),
+    ])
+    monkeypatch.setattr(mcp_server, "_load", lambda: {"hosts": []})
+    monkeypatch.setattr("cluster_job_monitor.collector.collect", lambda *a, **k: snap)
+    out = mcp_server.cluster_overview()
+    budget = out["clusters"][0]["budget"]
+    assert budget[0]["account"] == "prjs0123" and budget[0]["remaining"] == 600.0
+    assert budget[0]["pct_used"] == 0.4
 
 
 def test_my_jobs_success(monkeypatch):

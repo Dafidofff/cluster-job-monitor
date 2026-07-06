@@ -39,12 +39,17 @@ cluster-jobs-mcp
 
 | tool               | returns                                                              |
 |--------------------|---------------------------------------------------------------------|
-| `cluster_overview` | the [overview JSON](agent-overview.md#the-json-shape) — free CPUs/GPUs + your jobs, per cluster & partition |
+| `cluster_overview` | the [overview JSON](agent-overview.md#the-json-shape) — free CPUs/GPUs + your jobs + budget (if configured), per cluster & partition |
 | `my_jobs`          | just your jobs per cluster (skips `sinfo`, lighter)                  |
 
-- **`cluster_overview`** — queued/running jobs and free CPUs/GPUs, per cluster
-  and per partition. Call it before submitting work to see where there is
-  capacity. Runs only `squeue --me` and `sinfo` on each host.
+- **`cluster_overview`** — queued/running jobs, free CPUs/GPUs, and (for hosts
+  configured with an `"accounting"` source) your per-account compute budget,
+  per cluster and per partition. Call it before submitting work to see where
+  there is capacity *and* whether the job fits your allocation. Runs only
+  `squeue --me`, `sinfo`, and — when configured — `sacctmgr`/`sreport` or
+  `budget-overview` on each host. See the
+  [budget field notes](agent-overview.md#field-notes-and-caveats) for the two
+  sources and their caveats.
 - **`my_jobs`** — your current jobs across every configured cluster, with no
   capacity data. Lighter than `cluster_overview` (skips the `sinfo` call); use
   it when you only need to know what you have queued, not where free GPUs are.

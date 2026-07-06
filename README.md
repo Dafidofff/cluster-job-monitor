@@ -116,9 +116,12 @@ there's a one-shot overview that answers, in a single call:
 
 - how many jobs you have **queued / running**, per cluster and per partition,
 - how many **CPUs and GPUs are still free** — broken down **by GPU type**
-  (a100/h100/…) and with the largest free block on a **single node**, and
+  (a100/h100/…) and with the largest free block on a **single node**,
 - an **approximate queueing time**: SLURM's estimated start for your pending
-  jobs, plus a per-partition pre-submission wait estimate.
+  jobs, plus a per-partition pre-submission wait estimate, and
+- your **compute budget** (granted / used / remaining) for clusters configured
+  with an `"accounting"` source — so an agent can tell whether a submission
+  would fit *before* it queues, not just whether GPUs are free.
 
 ```bash
 cluster-jobs --overview          # human-readable capacity table
@@ -160,6 +163,11 @@ read-only). All of it is folded into the **same SSH round-trip** as
             "wait_estimate": ">=2h35m (11 queued)"
           }
         }
+      ],
+      "budget": [
+        { "account": "prjs0123", "source": "sacctmgr", "unit": "core-hours",
+          "granted": 1000000.0, "used": 620000.0, "remaining": 380000.0,
+          "pct_used": 0.62, "note": "" }
       ]
     }
   ]
@@ -182,6 +190,28 @@ Notes:
   free now, else `~<t>`/`>=<t>` derived from the soonest-finishing running job
   (`soonest_free_sec`) and the pending depth. It's optimistic — it doesn't model
   scheduler priority — so treat it as "ballpark".
+- `budget` is **empty unless the host config sets `"accounting"`** (see below).
+  Each entry carries a `source`: `"sacctmgr"` uses native SLURM accounting
+  (`GrpTRESMins` + `sreport`, `unit: "core-hours"`) and is well-tested — but
+  `granted`/`remaining` are `null` on sites that don't cap via `GrpTRESMins`
+  (many bill externally); that's an absence of a cap, not a parse error.
+  `"budget-overview"` wraps a SURF-specific script whose exact output format
+  we could **not** verify, so its numbers are **best-effort** (flagged in
+  `note`) — validate them against your cluster's real output before trusting
+  them. Units differ between sources, so compare within a source, not across.
+
+To enable it, add `"accounting"` to a host in `clusters.json`:
+
+```json
+{ "name": "Snellius", "ssh": "snellius", "accounting": "budget-overview" }
+{ "name": "DAS6",     "ssh": "das6",     "accounting": "sacctmgr" }
+```
+
+Use `"sacctmgr"` (recommended) on any standard SLURM cluster; use
+`"budget-overview"` for SURF clusters (e.g. Snellius) that track allocations
+outside SLURM's own limits. Optional companions: `"accounting_account"` filters
+to one account/project; `"accounting_args"` appends raw flags to
+`budget-overview` (e.g. `"-p gpu"`).
 
 ### As an MCP tool
 
@@ -203,10 +233,10 @@ from a source checkout.)
 
 It serves two tools:
 
-| tool               | returns                                                         |
-|--------------------|----------------------------------------------------------------|
-| `cluster_overview` | the JSON above — free CPUs/GPUs + your jobs, per cluster & part |
-| `my_jobs`          | just your jobs per cluster (skips `sinfo`, lighter)            |
+| tool               | returns                                                              |
+|--------------------|----------------------------------------------------------------------|
+| `cluster_overview` | the JSON above — free CPUs/GPUs + your jobs + budget, per cluster/part |
+| `my_jobs`          | just your jobs per cluster (skips `sinfo`, lighter)                  |
 
 ## Keys
 
