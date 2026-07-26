@@ -63,6 +63,19 @@ TRES_SENTINEL = "@@TRES"
 SINFO_FORMAT = "NodeHost:30,Partition:30,StateLong:20,CPUsState:25,Gres:50,GresUsed:50"
 SINFO_SENTINEL = "@@SINFO"
 
+# Budget/accounting probes (opt-in per host via the "accounting" config key).
+# Two independent sources, each behind its own sentinel so _collect_host can
+# split them out of the combined SSH output.
+#   sacctmgr: the account's granted TRES-minute cap (association-level).
+#   sreport:  the account's used TRES-hours (usage-by-account over a window).
+# Both take a `format=...` argument (not -o, which is a squeue/sinfo flag) and
+# support -P (parsable, no trailing sep) + -n (no header).
+SACCTMGR_SENTINEL = "@@SACCTMGR"
+SREPORT_SENTINEL = "@@SREPORT"
+BUDGET_OVERVIEW_SENTINEL = "@@BUDGETOVERVIEW"
+SACCTMGR_FORMAT = "Account,GrpTRESMins,GrpTRESRunMins"
+SREPORT_FORMAT = "Account,Used"
+
 # How states map to a coarse bucket used for summaries + colouring.
 RUNNING_STATES = {"RUNNING"}
 PENDING_STATES = {"PENDING"}
@@ -201,6 +214,45 @@ class Partition:
 
 
 @dataclass
+class Budget:
+    """One account's compute allocation on one cluster.
+
+    Populated only for hosts whose config sets ``"accounting"``. Two
+    independent, non-comparable sources exist:
+
+    - ``source="sacctmgr"``: native SLURM (``GrpTRESMins`` cap + ``sreport``
+      usage), ``unit="core-hours"``. Well-specified and tested. NOTE: many
+      sites don't enforce budgets via ``GrpTRESMins`` at all (they bill
+      externally) — on such clusters ``granted``/``remaining`` will
+      legitimately be ``None``; that's an absence-of-cap, not a parse failure.
+    - ``source="budget-overview"``: SURF-specific script, ``unit`` as detected
+      from the text (best-effort — the real output format is unverified).
+
+    Always check ``source``/``unit`` before comparing numbers across hosts.
+    """
+
+    account: str
+    source: str  # "sacctmgr" | "budget-overview"
+    unit: str
+    granted: Optional[float] = None
+    used: Optional[float] = None
+    remaining: Optional[float] = None
+    note: str = ""
+
+    @property
+    def pct_used(self) -> Optional[float]:
+        """Fraction of the granted budget consumed (0..1), or None if unknown."""
+        if self.granted and self.granted > 0 and self.used is not None:
+            return max(0.0, min(1.0, self.used / self.granted))
+        return None
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["pct_used"] = self.pct_used
+        return d
+
+
+@dataclass
 class Host:
     name: str
     ok: bool = True
@@ -211,6 +263,9 @@ class Host:
     # Capacity overview (populated only when collected with_partitions). The
     # cluster-level totals dedupe nodes shared across partitions.
     partitions: list[Partition] = field(default_factory=list)
+    # Per-account compute budget (populated only for hosts whose config sets
+    # "accounting", and only on the with_partitions overview path).
+    budgets: list[Budget] = field(default_factory=list)
     cpus_free: int = 0
     cpus_total: int = 0
     gpus_free: int = 0
@@ -257,6 +312,7 @@ class Host:
                 "gpus_total": self.gpus_total,
             },
             "partitions": [p.to_dict() for p in self.partitions],
+            "budgets": [b.to_dict() for b in self.budgets],
             "jobs": [j.to_dict() for j in self.jobs],
         }
 
@@ -599,6 +655,146 @@ def _fold_queue(partitions: list[Partition], stats: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Budget / accounting parsing
+# --------------------------------------------------------------------------- #
+# A bare number, optionally with thousands separators (e.g. "1,234" or "12.5").
+_NUM_RE = re.compile(r"^-?[\d,]+(\.\d+)?$")
+# Unit words the SURF budget-overview output might carry; used only as a label.
+_UNIT_HINT_RE = re.compile(r"\b(sbu|core-?hours?|hours?)\b", re.IGNORECASE)
+
+
+def _parse_tres_mins(value: str, tres_key: str = "cpu") -> Optional[float]:
+    """Extract one TRES's minute value from a ``GrpTRESMins``-style string.
+
+    Format is comma-separated ``key=value`` (e.g. ``cpu=175200000,gres/gpu=8760000``).
+    Returns None if unset/blank (an unset cap means unlimited) or the key is
+    absent or non-numeric.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    for pair in value.split(","):
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        if k.strip() == tres_key:
+            try:
+                return float(v)
+            except ValueError:
+                return None
+    return None
+
+
+def parse_sacctmgr_output(text: str) -> dict:
+    """Parse ``sacctmgr show associations -n -P format=Account,GrpTRESMins,GrpTRESRunMins``.
+
+    Returns ``{account: granted_hours_or_None}``. ``GrpTRESMins`` is preferred;
+    if unset we fall back to ``GrpTRESRunMins`` (a live decrementing counter
+    some sites use instead). A ``None`` value means no cap is configured for
+    that account (unlimited). Malformed/short lines are skipped.
+    """
+    out: dict = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) < 3:
+            continue
+        account = fields[0].strip()
+        if not account:
+            continue
+        mins = _parse_tres_mins(fields[1])
+        if mins is None:
+            mins = _parse_tres_mins(fields[2])
+        out[account] = mins / 60 if mins is not None else None
+    return out
+
+
+def parse_sreport_output(text: str) -> dict:
+    """Parse ``sreport -n -P -t hours cluster AccountUtilizationByUser format=Account,Used``.
+
+    Returns ``{account: used_hours}``. ``AccountUtilizationByUser`` emits one
+    row per (account, user) pair, so rows for the same account are summed —
+    that's the total consumed against the shared account budget. Malformed or
+    non-numeric lines are skipped.
+    """
+    out: dict = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) < 2:
+            continue
+        account = fields[0].strip()
+        if not account:
+            continue
+        try:
+            used = float(fields[1].strip())
+        except ValueError:
+            continue
+        out[account] = out.get(account, 0.0) + used
+    return out
+
+
+def parse_sacctmgr_and_sreport(sacctmgr_text: str, sreport_text: str) -> list[Budget]:
+    """Combine granted (sacctmgr) + used (sreport) into per-account Budgets.
+
+    ``remaining`` is computed only when both granted and used are known; an
+    account seen in only one source still yields a Budget (with None for the
+    missing side).
+    """
+    granted = parse_sacctmgr_output(sacctmgr_text)
+    used = parse_sreport_output(sreport_text)
+    accounts = list(granted) + [a for a in used if a not in granted]
+    budgets = []
+    for account in accounts:
+        g, u = granted.get(account), used.get(account)
+        remaining = (g - u) if (g is not None and u is not None) else None
+        budgets.append(Budget(account=account, source="sacctmgr", unit="core-hours",
+                               granted=g, used=u, remaining=remaining))
+    return budgets
+
+
+def parse_budget_overview_output(text: str) -> list[Budget]:
+    """Lenient parser for the (unverified) SURF ``budget-overview`` command.
+
+    The real output format could not be confirmed, so this is intentionally
+    permissive: it looks for lines shaped like ``<name> <num> <num> [num]``
+    (whitespace- or pipe-delimited) and skips anything else — headers,
+    banners, blank lines — rather than raising. With three numbers they are
+    read as granted/used/remaining; with two they are read as used/granted and
+    remaining is inferred. Every entry is tagged so downstream consumers know
+    the numbers are best-effort. Validate against real output before trusting.
+    """
+    budgets: list[Budget] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        toks = [t.strip() for t in
+                (line.split("|") if "|" in line else line.split()) if t.strip()]
+        if len(toks) < 3:
+            continue
+        name = toks[0]
+        numeric = [t for t in toks[1:] if _NUM_RE.match(t)]
+        if len(numeric) < 2:
+            continue
+        nums = [float(t.replace(",", "")) for t in numeric[:3]]
+        unit_match = _UNIT_HINT_RE.search(line)
+        unit = unit_match.group(0).lower() if unit_match else "unknown"
+        if len(nums) >= 3:
+            granted, used, remaining = nums[0], nums[1], nums[2]
+        else:
+            used, granted = nums[0], nums[1]
+            remaining = granted - used
+        budgets.append(Budget(
+            account=name, source="budget-overview", unit=unit,
+            granted=granted, used=used, remaining=remaining,
+            note="best-effort parse of unverified budget-overview format"))
+    return budgets
+
+
+# --------------------------------------------------------------------------- #
 # Non-SLURM GPU hosts (nvidia-smi + ps)
 # --------------------------------------------------------------------------- #
 # Single SSH round-trip: emit a GPU inventory section then one line per GPU
@@ -739,12 +935,68 @@ def _slice_between(text: str, start: str, stops: tuple[str, ...]) -> str:
     return seg[:cut]
 
 
-def _build_squeue_cmd(with_partitions: bool = False) -> str:
+def _build_accounting_cmd(spec: dict) -> str:
+    """Build the accounting-probe fragment for one host's config.
+
+    Returns "" when the host doesn't request accounting data (``"accounting"``
+    absent or an unknown value), so nothing extra is run. Each probe is wrapped
+    in ``2>/dev/null || true`` so a missing/failing accounting tool never fails
+    the whole host — it just yields no budget data.
+    """
+    mode = (spec.get("accounting") or "").lower()
+    if not mode:
+        return ""
+    account = spec.get("accounting_account")
+
+    if mode == "sacctmgr":
+        acct_filter = f" Accounts={shlex.quote(account)}" if account else ""
+        sacctmgr = (f"sacctmgr show associations -n -P "
+                    f"format={SACCTMGR_FORMAT}{acct_filter}")
+        # Explicit wide window so a mid-period query shows lifetime-to-date
+        # usage instead of silently defaulting to month-to-date.
+        sreport = (f"sreport -n -P -t hours cluster AccountUtilizationByUser "
+                   f"start=2000-01-01 end=now format={SREPORT_FORMAT}{acct_filter}")
+        return (f"echo '{SACCTMGR_SENTINEL}'; {sacctmgr} 2>/dev/null || true; "
+                f"echo '{SREPORT_SENTINEL}'; {sreport} 2>/dev/null || true")
+
+    if mode == "budget-overview":
+        extra = spec.get("accounting_args", "")
+        cmd = "budget-overview" + (f" {extra}" if extra else "")
+        return f"echo '{BUDGET_OVERVIEW_SENTINEL}'; {cmd} 2>/dev/null || true"
+
+    return ""  # unknown mode -> collect nothing, don't fail the host
+
+
+def _extract_budgets(spec: dict, text: str) -> tuple[str, list[Budget]]:
+    """Split the accounting section off the tail of ``text`` and parse it.
+
+    Returns ``(text_before_accounting, budgets)``. The accounting probes are
+    appended after everything else, so their sentinel marks where the preceding
+    block ends and the budget data begins. Returns the text unchanged and an
+    empty list when no accounting sentinel is present (tool absent, mode
+    unknown, or the probe produced nothing).
+    """
+    mode = (spec.get("accounting") or "").lower()
+    if mode == "sacctmgr" and SACCTMGR_SENTINEL in text:
+        head, tail = text.split(SACCTMGR_SENTINEL, 1)
+        if SREPORT_SENTINEL in tail:
+            sacctmgr_text, sreport_text = tail.split(SREPORT_SENTINEL, 1)
+        else:
+            sacctmgr_text, sreport_text = tail, ""
+        return head, parse_sacctmgr_and_sreport(sacctmgr_text, sreport_text)
+    if mode == "budget-overview" and BUDGET_OVERVIEW_SENTINEL in text:
+        head, tail = text.split(BUDGET_OVERVIEW_SENTINEL, 1)
+        return head, parse_budget_overview_output(tail)
+    return text, []
+
+
+def _build_squeue_cmd(with_partitions: bool = False, accounting_cmd: str = "") -> str:
     # Same single SSH round-trip. The base always carries a second --me pass
     # (@@TRES) for GPU counts (see SQUEUE_TRES_FORMAT); the overview adds sinfo
-    # capacity and the cluster-wide queue. ``exit $rc`` propagates the primary
-    # --me squeue status so a real squeue failure is still surfaced, while a
-    # missing/failing tres, sinfo, or queue probe only loses that extra data.
+    # capacity and the cluster-wide queue; hosts with "accounting" configured
+    # add budget probes. ``exit $rc`` propagates the primary --me squeue status
+    # so a real squeue failure is still surfaced, while a missing/failing tres,
+    # sinfo, queue, or accounting probe only loses that extra data.
     squeue = f"squeue --me --noheader -o '{SQUEUE_FORMAT}'"
     tres = f"squeue --me -h -O '{SQUEUE_TRES_FORMAT}'"
     parts = [f"{squeue}; rc=$?;",
@@ -754,6 +1006,8 @@ def _build_squeue_cmd(with_partitions: bool = False) -> str:
         queue = f"squeue -a -h -o '{QUEUE_FORMAT}'"
         parts.append(f"echo '{SINFO_SENTINEL}'; {sinfo} 2>/dev/null || true;")
         parts.append(f"echo '{QUEUE_SENTINEL}'; {queue} 2>/dev/null || true;")
+    if accounting_cmd:
+        parts.append(accounting_cmd + ";")
     parts.append("exit $rc")
     return " ".join(parts)
 
@@ -762,7 +1016,11 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
     name = spec.get("name", spec.get("ssh") or "host")
     scheduler = spec.get("scheduler", "slurm").lower()
     host = Host(name=name, kind="gpu" if scheduler in ("gpu", "nvidia") else "slurm")
-    remote_cmd = GPU_CMD if host.kind == "gpu" else _build_squeue_cmd(with_partitions)
+    # Budget/accounting is a SLURM-only, overview-only probe (mirrors sinfo).
+    accounting_cmd = (_build_accounting_cmd(spec)
+                      if host.kind == "slurm" and with_partitions else "")
+    remote_cmd = (GPU_CMD if host.kind == "gpu"
+                  else _build_squeue_cmd(with_partitions, accounting_cmd))
 
     if spec.get("local"):
         argv = ["/bin/sh", "-c", remote_cmd]
@@ -822,8 +1080,9 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
     else:
         out = proc.stdout
         # Sections are delimited by sentinels in a fixed order (squeue, @@TRES,
-        # then optionally @@SINFO/@@QUEUE). Slice each out position-tolerantly
-        # so missing sections (e.g. non-overview calls) never misalign parsing.
+        # then optionally @@SINFO/@@QUEUE, then optional accounting probes).
+        # Slice each out position-tolerantly so missing sections (non-overview
+        # calls, hosts without accounting) never misalign parsing.
         first = len(out)
         for s in (TRES_SENTINEL, SINFO_SENTINEL, QUEUE_SENTINEL):
             i = out.find(s)
@@ -832,7 +1091,13 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
         squeue_text = out[:first]
         tres_text = _slice_between(out, TRES_SENTINEL, (SINFO_SENTINEL, QUEUE_SENTINEL))
         sinfo_text = _slice_between(out, SINFO_SENTINEL, (QUEUE_SENTINEL,))
+        # queue_text runs to the end, so it also carries the accounting tail;
+        # peel that off first (its sacctmgr/sreport rows are pipe-delimited and
+        # would otherwise be mistaken for queue lines). Accounting only runs on
+        # the with_partitions path.
         queue_text = _slice_between(out, QUEUE_SENTINEL, ())
+        if accounting_cmd:
+            queue_text, host.budgets = _extract_budgets(spec, queue_text)
         host.jobs = parse_squeue_output(squeue_text)
         # Fill in GPU counts for jobs whose %b was empty (--gpus/--gpus-per-task
         # style) from the tres-per-job second pass.
@@ -901,6 +1166,8 @@ def build_overview(snapshot: Snapshot) -> dict:
             "free": {"cpus": h.cpus_free, "gpus": h.gpus_free},
             "capacity": {"cpus": h.cpus_total, "gpus": h.gpus_total},
             "partitions": [p.to_dict() for p in h.partitions],
+            # Per-account budget; empty unless the host config sets "accounting".
+            "budget": [b.to_dict() for b in h.budgets],
         })
     return {"generated_at": snapshot.generated_at, "clusters": clusters}
 

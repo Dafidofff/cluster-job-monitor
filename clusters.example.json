@@ -5,13 +5,15 @@
       "name": "Snellius",
       "ssh": "snellius",
       "partitions": ["gpu", "gpu_a100"],
-      "local": false
+      "local": false,
+      "accounting": "budget-overview"
     },
     {
       "name": "DAS6",
       "ssh": "das6",
       "partitions": ["defq"],
-      "local": false
+      "local": false,
+      "accounting": "sacctmgr"
     },
     {
       "name": "Desktop",

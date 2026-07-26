@@ -5,9 +5,12 @@ there's a one-shot overview that answers, in a single call:
 
 - how many jobs you have **queued / running**, per cluster and per partition,
 - how many **CPUs and GPUs are still free** — broken down **by GPU type**
-  (a100/h100/…) and with the largest free block on a **single node**, and
+  (a100/h100/…) and with the largest free block on a **single node**,
 - an **approximate queueing time**: SLURM's estimated start for your pending
-  jobs, plus a per-partition pre-submission wait estimate.
+  jobs, plus a per-partition pre-submission wait estimate, and
+- your **compute budget** (granted / used / remaining) per account, for
+  clusters configured with an `"accounting"` source — so you can tell whether a
+  submission fits the allocation *before* it queues.
 
 ## Usage
 
@@ -56,6 +59,15 @@ Prefer to call it natively from an agent? The same overview is exposed over
             "wait_estimate": ">=2h35m (11 queued)"
           }
         }
+      ],
+      "budget": [
+        { "account": "prjs0123", "source": "sacctmgr", "unit": "core-hours",
+          "granted": 1000000.0, "used": 620000.0, "remaining": 380000.0,
+          "pct_used": 0.62, "note": "" },
+        { "account": "gpu-budget", "source": "budget-overview", "unit": "sbu",
+          "granted": 500000.0, "used": 210000.0, "remaining": 290000.0,
+          "pct_used": 0.42,
+          "note": "best-effort parse of unverified budget-overview format" }
       ]
     }
   ]
@@ -85,3 +97,20 @@ Prefer to call it natively from an agent? The same overview is exposed over
   free now, else `~<t>` / `>=<t>` derived from the soonest-finishing running job
   (`soonest_free_sec`) and the pending depth. It's optimistic — it doesn't model
   scheduler priority — so treat it as "ballpark".
+- **`budget` is empty unless the host config sets `"accounting"`.** Two sources
+  exist, with different reliability and units — always read `source`/`unit`
+  before trusting or comparing numbers:
+    - `source: "sacctmgr"` — native SLURM accounting (`GrpTRESMins` for the
+      granted cap, `sreport` for used hours), `unit: "core-hours"`. This is the
+      well-tested path. **`granted`/`remaining` are `null` when the site
+      doesn't cap via `GrpTRESMins`** (many clusters, including SURF's, bill
+      allocations outside SLURM) — that's an absence-of-cap, *not* a parse
+      failure.
+    - `source: "budget-overview"` — a SURF-specific script whose output format
+      we **could not verify**. The parser is deliberately lenient and every
+      entry is tagged in `note`; treat the numbers as **best-effort** and
+      validate against your cluster's real output before relying on them for
+      submission decisions.
+  `pct_used` is `used / granted` clamped to `[0, 1]`, or `null` when either is
+  unknown. Because units and semantics differ between sources, compare budgets
+  **within** a source/cluster, not across them.
