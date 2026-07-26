@@ -43,6 +43,16 @@ _MIN_JOB_FIELDS = 11
 QUEUE_FORMAT = "%P|%T|%L"
 QUEUE_SENTINEL = "@@QUEUE"
 
+# Second --me pass for GPU counts. squeue's -o "%b" only carries TRES-per-node
+# (GPUs requested with --gres=gpu:...). Jobs that request GPUs with --gpus /
+# --gpus-per-task record them as TRES-per-job instead, leaving %b as "N/A" so
+# the primary parse sees 0 GPUs. There is no -o code for tres-per-job, so we
+# ask for it via the long -O format in a tiny second pass. Both columns are
+# whitespace-free (a jobid and a "gres/gpu:N" token), so the fixed-width -O
+# output splits cleanly on whitespace even though job names elsewhere can't.
+SQUEUE_TRES_FORMAT = "JobID:45,tres-per-job:45"
+TRES_SENTINEL = "@@TRES"
+
 # sinfo output for the agent capacity overview. One line per node *per
 # partition* (-N), so it aggregates straight into per-partition tallies.
 # Field values never contain whitespace, so the fixed widths split cleanly.
@@ -450,6 +460,25 @@ def parse_squeue_output(text: str) -> list[Job]:
         if job is not None:
             jobs.append(job)
     return jobs
+
+
+def parse_squeue_tres(text: str) -> dict:
+    """Parse the ``JobID  tres-per-job`` second pass into ``{jobid: gpu_count}``.
+
+    Only jobs whose TRES-per-job carries a GPU are returned; others (``N/A``,
+    CPU-only) are omitted so the caller can use ``.get(jobid)`` as a pure
+    fallback. Values are whitespace-free, so a plain ``split()`` is safe even
+    though the ``-O`` output is fixed-width.
+    """
+    out: dict = {}
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) < 2:
+            continue
+        gpus = parse_gpus(toks[1])
+        if gpus:
+            out[toks[0]] = gpus
+    return out
 
 
 # Node states we treat as having usable (allocatable) GPUs. Down/drained nodes
@@ -887,6 +916,25 @@ def gpu_note(gpus: list[dict]) -> str:
 # --------------------------------------------------------------------------- #
 # Collection
 # --------------------------------------------------------------------------- #
+def _slice_between(text: str, start: str, stops: tuple[str, ...]) -> str:
+    """Return the slice of ``text`` after ``start`` up to the earliest ``stop``.
+
+    Returns "" if ``start`` isn't present. Order-tolerant: used to peel each
+    sentinel-delimited section out of the combined command output regardless of
+    which optional sections are present.
+    """
+    i = text.find(start)
+    if i == -1:
+        return ""
+    seg = text[i + len(start):]
+    cut = len(seg)
+    for s in stops:
+        j = seg.find(s)
+        if j != -1:
+            cut = min(cut, j)
+    return seg[:cut]
+
+
 def _build_accounting_cmd(spec: dict) -> str:
     """Build the accounting-probe fragment for one host's config.
 
@@ -943,18 +991,19 @@ def _extract_budgets(spec: dict, text: str) -> tuple[str, list[Budget]]:
 
 
 def _build_squeue_cmd(with_partitions: bool = False, accounting_cmd: str = "") -> str:
+    # Same single SSH round-trip. The base always carries a second --me pass
+    # (@@TRES) for GPU counts (see SQUEUE_TRES_FORMAT); the overview adds sinfo
+    # capacity and the cluster-wide queue; hosts with "accounting" configured
+    # add budget probes. ``exit $rc`` propagates the primary --me squeue status
+    # so a real squeue failure is still surfaced, while a missing/failing tres,
+    # sinfo, queue, or accounting probe only loses that extra data.
     squeue = f"squeue --me --noheader -o '{SQUEUE_FORMAT}'"
-    if not with_partitions and not accounting_cmd:
-        return squeue
-    # Same single SSH round-trip: my jobs, a sentinel, partition capacity, a
-    # sentinel, the cluster-wide queue (all users) for wait estimates, then the
-    # optional accounting probes. ``exit $rc`` propagates the --me squeue status
-    # so a real squeue failure is still surfaced, while a missing/failing sinfo,
-    # queue, or accounting probe only loses the corresponding extra data.
-    sinfo = f"sinfo -h -N -O '{SINFO_FORMAT}'"
-    queue = f"squeue -a -h -o '{QUEUE_FORMAT}'"
-    parts = [f"{squeue}; rc=$?;"]
+    tres = f"squeue --me -h -O '{SQUEUE_TRES_FORMAT}'"
+    parts = [f"{squeue}; rc=$?;",
+             f"echo '{TRES_SENTINEL}'; {tres} 2>/dev/null || true;"]
     if with_partitions:
+        sinfo = f"sinfo -h -N -O '{SINFO_FORMAT}'"
+        queue = f"squeue -a -h -o '{QUEUE_FORMAT}'"
         parts.append(f"echo '{SINFO_SENTINEL}'; {sinfo} 2>/dev/null || true;")
         parts.append(f"echo '{QUEUE_SENTINEL}'; {queue} 2>/dev/null || true;")
     if accounting_cmd:
@@ -1030,22 +1079,33 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
         host.gpus_free = sum(1 for g in gpus if g["index"] not in busy)
     else:
         out = proc.stdout
-        sinfo_text = queue_text = ""
-        if with_partitions and SINFO_SENTINEL in out:
-            squeue_text, rest = out.split(SINFO_SENTINEL, 1)
-            if QUEUE_SENTINEL in rest:
-                sinfo_text, queue_text = rest.split(QUEUE_SENTINEL, 1)
-            else:
-                sinfo_text = rest
-        else:
-            squeue_text = out
-        # Peel the optional accounting section off the tail of the queue block
-        # (it's appended last). Do this before parsing the queue: sacctmgr/
-        # sreport rows are pipe-delimited and would otherwise be mistaken for
-        # queue lines. Accounting only runs on the with_partitions path.
+        # Sections are delimited by sentinels in a fixed order (squeue, @@TRES,
+        # then optionally @@SINFO/@@QUEUE, then optional accounting probes).
+        # Slice each out position-tolerantly so missing sections (non-overview
+        # calls, hosts without accounting) never misalign parsing.
+        first = len(out)
+        for s in (TRES_SENTINEL, SINFO_SENTINEL, QUEUE_SENTINEL):
+            i = out.find(s)
+            if i != -1:
+                first = min(first, i)
+        squeue_text = out[:first]
+        tres_text = _slice_between(out, TRES_SENTINEL, (SINFO_SENTINEL, QUEUE_SENTINEL))
+        sinfo_text = _slice_between(out, SINFO_SENTINEL, (QUEUE_SENTINEL,))
+        # queue_text runs to the end, so it also carries the accounting tail;
+        # peel that off first (its sacctmgr/sreport rows are pipe-delimited and
+        # would otherwise be mistaken for queue lines). Accounting only runs on
+        # the with_partitions path.
+        queue_text = _slice_between(out, QUEUE_SENTINEL, ())
         if accounting_cmd:
             queue_text, host.budgets = _extract_budgets(spec, queue_text)
         host.jobs = parse_squeue_output(squeue_text)
+        # Fill in GPU counts for jobs whose %b was empty (--gpus/--gpus-per-task
+        # style) from the tres-per-job second pass.
+        tres_gpus = parse_squeue_tres(tres_text)
+        if tres_gpus:
+            for job in host.jobs:
+                if job.gpus == 0:
+                    job.gpus = tres_gpus.get(job.jobid, 0)
         if with_partitions:
             partitions, totals = parse_sinfo_output(sinfo_text)
             _fold_my_jobs(partitions, host.jobs)
