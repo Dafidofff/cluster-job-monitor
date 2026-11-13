@@ -25,7 +25,9 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.2"]
+# Capped below 2.0: the 2.x SDK renamed FastMCP (mcp.server.fastmcp) to
+# MCPServer, which mcp_server.py doesn't speak yet.
+mcp = ["mcp>=1.2,<2"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "pytest-cov>=5"]
 
 [project.scripts]

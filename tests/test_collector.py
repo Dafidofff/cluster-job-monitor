@@ -38,6 +38,10 @@ def test_parse_slurm_time(value, expected):
     ("gres/gpu:a100:2", 2),
     ("gpu:4", 4),
     ("gres/gpu:2,gres/gpu:1", 3),
+    ("gpu:rtx-a6000:4", 4),                    # dash in type
+    ("gpu:1g.10gb:2", 2),                      # MIG profile (dot in type)
+    ("gpu:nvidia_h100-80gb:8(S:0-1)", 8),      # dash + socket suffix
+    ("gpu:a100:4(IDX:0-3)", 4),                # GresUsed form
     ("cpu=8,mem=16G", 0),
     ("", 0),
 ])

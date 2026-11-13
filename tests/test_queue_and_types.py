@@ -29,8 +29,12 @@ def test_parse_gpus_by_type(tres, expected):
     assert parse_gpus_by_type(tres) == expected
 
 
-def test_by_type_sums_to_total():
-    s = "gpu:a100:4,gpu:h100:2,gpu:3"
+@pytest.mark.parametrize("s", [
+    "gpu:a100:4,gpu:h100:2,gpu:3",
+    "gpu:rtx-a6000:4,gpu:1g.10gb:2",             # dashes / dots in the type
+    "gpu:nvidia_h100-80gb:8(S:0-1)",
+])
+def test_by_type_sums_to_total(s):
     assert sum(parse_gpus_by_type(s).values()) == collector.parse_gpus(s)
 
 

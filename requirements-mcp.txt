@@ -1,3 +1,4 @@
 # Optional: only needed to run mcp_server.py (the agent-facing MCP wrapper).
 # The core collector and TUI do not depend on this.
-mcp>=1.2
+# Capped below 2.0: the 2.x SDK renamed FastMCP to MCPServer.
+mcp>=1.2,<2

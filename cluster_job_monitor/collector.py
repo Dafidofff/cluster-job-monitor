@@ -55,12 +55,18 @@ TRES_SENTINEL = "@@TRES"
 
 # sinfo output for the agent capacity overview. One line per node *per
 # partition* (-N), so it aggregates straight into per-partition tallies.
-# Field values never contain whitespace, so the fixed widths split cleanly.
+# Field values never contain whitespace, so the columns split cleanly — as
+# long as no value reaches its column width: -O truncates at the width and
+# emits no separator, so an over-long value runs into the next column and the
+# line no longer parses. GRES strings get long (several GRES per node, socket
+# and index suffixes), hence the generous widths; the padding is squeezed out
+# on the remote side (see _build_squeue_cmd) so it never crosses the wire.
 #   NodeHost   node name (used to dedupe shared nodes for cluster totals)
 #   Partition  partition name        StateLong  node state (idle/mixed/...)
 #   CPUsState  alloc/idle/other/total            Gres  configured GPUs
 #   GresUsed   allocated GPUs
-SINFO_FORMAT = "NodeHost:30,Partition:30,StateLong:20,CPUsState:25,Gres:50,GresUsed:50"
+SINFO_FORMAT = ("NodeHost:64,Partition:64,StateLong:32,CPUsState:32,"
+                "Gres:256,GresUsed:256")
 SINFO_SENTINEL = "@@SINFO"
 
 # Budget/accounting probes (opt-in per host via the "accounting" config key).
@@ -75,6 +81,11 @@ SREPORT_SENTINEL = "@@SREPORT"
 BUDGET_OVERVIEW_SENTINEL = "@@BUDGETOVERVIEW"
 SACCTMGR_FORMAT = "Account,GrpTRESMins,GrpTRESRunMins"
 SREPORT_FORMAT = "Account,Used"
+# Wall-clock cap (seconds) on each accounting tool. They query slurmdbd, which
+# can crawl or hang; uncapped, one slow probe would run into HOST_TIMEOUT and
+# cost the host its job and capacity data too. Two probes at this cap still
+# leave room under HOST_TIMEOUT for the connection and squeue/sinfo.
+ACCOUNTING_TIMEOUT = 8
 
 # How states map to a coarse bucket used for summaries + colouring.
 RUNNING_STATES = {"RUNNING"}
@@ -345,9 +356,13 @@ class Snapshot:
 # Parsing helpers
 # --------------------------------------------------------------------------- #
 _UNBOUNDED = {"", "UNLIMITED", "INVALID", "NOT_SET", "N/A"}
-_GPU_RE = re.compile(r"gpu(?::[A-Za-z0-9_]+)*:(\d+)", re.IGNORECASE)
+# Count from a GRES entry: gpu[:type]:N. The type charset must match
+# _GPU_TYPED_RE below, or the total and the per-type breakdown disagree
+# (a narrower set read gpu:rtx-a6000:4 as 0 and gpu:1g.10gb:2 as 1).
+_GPU_RE = re.compile(r"gpu(?::[A-Za-z0-9_.\-]+)*:(\d+)", re.IGNORECASE)
 # Captures the (optional) type and count from a GRES entry: gpu[:type]:N.
-# Type may contain dots/dashes for MIG profiles (e.g. gpu:1g.10gb:2).
+# Type may contain dots/dashes (MIG profiles like gpu:1g.10gb:2, or names
+# like gpu:rtx-a6000:4).
 _GPU_TYPED_RE = re.compile(r"gpu(?::([A-Za-z0-9_.\-]+))?:(\d+)", re.IGNORECASE)
 
 
@@ -941,12 +956,17 @@ def _build_accounting_cmd(spec: dict) -> str:
     Returns "" when the host doesn't request accounting data (``"accounting"``
     absent or an unknown value), so nothing extra is run. Each probe is wrapped
     in ``2>/dev/null || true`` so a missing/failing accounting tool never fails
-    the whole host — it just yields no budget data.
+    the whole host — it just yields no budget data. Each is also capped at
+    ``ACCOUNTING_TIMEOUT`` seconds so a hung one can't stall the host.
     """
     mode = (spec.get("accounting") or "").lower()
     if not mode:
         return ""
     account = spec.get("accounting_account")
+    # `timeout` is coreutils — on every Linux cluster, but not guaranteed on a
+    # "local" host (stock macOS lacks it) — so fall back to running uncapped.
+    guard = (f"if command -v timeout >/dev/null 2>&1; "
+             f"then _t='timeout {ACCOUNTING_TIMEOUT}'; else _t=; fi; ")
 
     if mode == "sacctmgr":
         acct_filter = f" Accounts={shlex.quote(account)}" if account else ""
@@ -956,13 +976,15 @@ def _build_accounting_cmd(spec: dict) -> str:
         # usage instead of silently defaulting to month-to-date.
         sreport = (f"sreport -n -P -t hours cluster AccountUtilizationByUser "
                    f"start=2000-01-01 end=now format={SREPORT_FORMAT}{acct_filter}")
-        return (f"echo '{SACCTMGR_SENTINEL}'; {sacctmgr} 2>/dev/null || true; "
-                f"echo '{SREPORT_SENTINEL}'; {sreport} 2>/dev/null || true")
+        return (f"{guard}"
+                f"echo '{SACCTMGR_SENTINEL}'; $_t {sacctmgr} 2>/dev/null || true; "
+                f"echo '{SREPORT_SENTINEL}'; $_t {sreport} 2>/dev/null || true")
 
     if mode == "budget-overview":
         extra = spec.get("accounting_args", "")
         cmd = "budget-overview" + (f" {extra}" if extra else "")
-        return f"echo '{BUDGET_OVERVIEW_SENTINEL}'; {cmd} 2>/dev/null || true"
+        return (f"{guard}"
+                f"echo '{BUDGET_OVERVIEW_SENTINEL}'; $_t {cmd} 2>/dev/null || true")
 
     return ""  # unknown mode -> collect nothing, don't fail the host
 
@@ -1004,7 +1026,9 @@ def _build_squeue_cmd(with_partitions: bool = False, accounting_cmd: str = "") -
     if with_partitions:
         sinfo = f"sinfo -h -N -O '{SINFO_FORMAT}'"
         queue = f"squeue -a -h -o '{QUEUE_FORMAT}'"
-        parts.append(f"echo '{SINFO_SENTINEL}'; {sinfo} 2>/dev/null || true;")
+        # tr squeezes SINFO_FORMAT's wide column padding before it is sent.
+        parts.append(f"echo '{SINFO_SENTINEL}'; "
+                     f"{sinfo} 2>/dev/null | tr -s ' ' || true;")
         parts.append(f"echo '{QUEUE_SENTINEL}'; {queue} 2>/dev/null || true;")
     if accounting_cmd:
         parts.append(accounting_cmd + ";")
