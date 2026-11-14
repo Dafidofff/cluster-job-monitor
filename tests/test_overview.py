@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import time
 import types
 
 import pytest
@@ -82,16 +85,137 @@ def test_sinfo_columns_are_wide_enough_for_long_gres():
     assert totals["gpus_free"] == 5
 
 
-def test_sinfo_padding_is_squeezed_remotely():
+def _fake_tool(directory, name, body):
+    """Drop an executable stub on a PATH dir. sinfo is run under `timeout`
+    where that exists, which can't see shell functions, so it needs a real
+    executable (squeue, which is never capped, can stay a shell function)."""
+    path = directory / name
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+def _run_sh(cmd, tool_dir, **kwargs):
+    env = {"PATH": f"{tool_dir}{os.pathsep}{os.environ['PATH']}"}
+    return subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True,
+                          env=env, **kwargs)
+
+
+def test_sinfo_padding_is_squeezed_remotely(tmp_path):
     # The wide columns are mostly padding; it must be stripped before it is
-    # sent back over SSH, and a failing sinfo must still be tolerated.
+    # sent back over SSH.
     full = collector._build_squeue_cmd(True)
     assert "| tr -s ' '" in full
-    cmd = ("squeue() { echo JOBLINE; return 0; }; "
-           "sinfo() { echo 'node01      gpu     idle'; }; " + full)
-    proc = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    _fake_tool(tmp_path, "sinfo", "echo 'node01      gpu     idle'")
+    proc = _run_sh("squeue() { echo JOBLINE; return 0; }; " + full, tmp_path)
     assert proc.returncode == 0
     assert "node01 gpu idle" in proc.stdout
+
+
+def test_hung_sinfo_is_time_capped_and_leaves_no_partial_data(tmp_path, monkeypatch):
+    # `sinfo -N` can take over a minute on very large clusters. Capped, it must
+    # cost only the capacity data — and what it printed before being cut off
+    # must not leak through, or it would be read as (too little) capacity.
+    if shutil.which("timeout") is None:
+        pytest.skip("no `timeout` binary on this machine")
+    monkeypatch.setattr(collector, "SINFO_TIMEOUT", 1)
+    _fake_tool(tmp_path, "sinfo", "echo 'node01 gpu idle 0/8/0/8 gpu:4 gpu:0'; exec sleep 30")
+    start = time.monotonic()
+    proc = _run_sh("squeue() { echo JOBLINE; return 0; }; "
+                   + collector._build_squeue_cmd(True), tmp_path, timeout=20)
+    assert time.monotonic() - start < 10
+    assert proc.returncode == 0
+    assert "JOBLINE" in proc.stdout              # job data survives
+    assert "node01" not in proc.stdout           # no partial node list
+
+
+# --------------------------------------------------------------------------- #
+# Partition filter ("partitions" in the host config)
+# --------------------------------------------------------------------------- #
+def test_partition_filter_narrows_sinfo_and_queue_only():
+    cmd = collector._build_squeue_cmd(True, partitions=["batch", "backfill"])
+    assert "sinfo -h -N -p batch,backfill -O" in cmd
+    assert "squeue -a -h -p batch,backfill -o" in cmd
+    # The user's own jobs are never filtered: they may sit in other partitions.
+    assert "squeue --me --noheader -o" in cmd
+    assert cmd.count(" -p ") == 2
+
+
+@pytest.mark.parametrize("partitions", [None, [], ["", "  "]])
+def test_no_partition_filter_when_unset(partitions):
+    cmd = collector._build_squeue_cmd(True, partitions=partitions)
+    assert " -p " not in cmd
+    assert "sinfo -h -N -O" in cmd
+
+
+def test_partition_filter_is_shell_quoted():
+    cmd = collector._build_squeue_cmd(True, partitions=["gpu; rm -rf ~"])
+    assert "-p 'gpu; rm -rf ~'" in cmd
+
+
+def test_collect_passes_host_partitions_and_overview_timeout(monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["cmd"], seen["timeout"] = argv[-1], kwargs["timeout"]
+        return types.SimpleNamespace(returncode=0, stdout=_COMBINED, stderr="")
+
+    monkeypatch.setattr(collector.subprocess, "run", fake_run)
+    host = {"name": "Big", "ssh": "big", "partitions": ["batch", "backfill"]}
+    collect({"hosts": [host]}, with_partitions=True)
+    assert "-p batch,backfill" in seen["cmd"]
+    assert seen["timeout"] == collector.OVERVIEW_HOST_TIMEOUT
+    # The plain job poll (live TUI) keeps the short timeout and runs no sinfo.
+    collect({"hosts": [host]})
+    assert "sinfo" not in seen["cmd"]
+    assert seen["timeout"] == collector.HOST_TIMEOUT
+
+
+def test_overview_timeout_leaves_room_for_every_probe_cap():
+    # The per-probe caps, not the host timeout, must be what cuts a slow probe.
+    assert collector.OVERVIEW_HOST_TIMEOUT > (
+        collector.SINFO_TIMEOUT + 2 * collector.ACCOUNTING_TIMEOUT)
+
+
+# --------------------------------------------------------------------------- #
+# gpus_per_node fallback (clusters that don't register GPUs as GRES)
+# --------------------------------------------------------------------------- #
+_NO_GRES_SINFO = (
+    "node01 batch* allocated 224/0/0/224 (null) (null)\n"
+    "node02 batch* idle 0/224/0/224 (null) (null)\n"
+    "node03 batch* drained 0/0/224/224 (null) (null)\n"
+)
+
+
+def test_gpus_per_node_fallback_for_nodes_without_gpu_gres():
+    parts, totals = parse_sinfo_output(_NO_GRES_SINFO, gpus_per_node=8)
+    p = parts[0]
+    assert p.gpus_total == 24                # 3 nodes x 8
+    assert p.gpus_alloc == 8                 # the allocated node is fully used
+    assert p.gpus_free == 8                  # only the idle node; drained excluded
+    assert p.gpus_max_free_node == 8
+    assert p.gpus_by_type == {"gpu": {"free": 8, "alloc": 8, "total": 24}}
+    assert totals["gpus_free"] == 8 and totals["gpus_total"] == 24
+
+
+def test_without_gpus_per_node_no_gres_means_no_gpus():
+    parts, totals = parse_sinfo_output(_NO_GRES_SINFO)
+    assert parts[0].gpus_total == 0 and totals["gpus_total"] == 0
+
+
+def test_gpus_per_node_does_not_override_reported_gres():
+    text = "node01 gpu mixed 8/120/0/128 gpu:a100:4 gpu:a100:1\n"
+    parts, _ = parse_sinfo_output(text, gpus_per_node=8)
+    assert parts[0].gpus_total == 4 and parts[0].gpus_free == 3
+    assert parts[0].gpus_by_type == {"a100": {"free": 3, "alloc": 1, "total": 4}}
+
+
+def test_collect_applies_gpus_per_node_from_host_config(monkeypatch):
+    out = "@@SINFO\n" + _NO_GRES_SINFO
+    monkeypatch.setattr(collector.subprocess, "run", lambda argv, **k:
+                        types.SimpleNamespace(returncode=0, stdout=out, stderr=""))
+    snap = collect({"hosts": [{"name": "WholeNode", "ssh": "w", "gpus_per_node": 8}]},
+                   with_partitions=True)
+    assert snap.hosts[0].gpus_total == 24 and snap.hosts[0].gpus_free == 8
 
 
 def test_parse_sinfo_excludes_unusable_nodes_from_free_gpus():
@@ -272,14 +396,12 @@ def test_build_squeue_cmd_with_and_without_partitions():
     assert collector.SINFO_SENTINEL in full and "exit $rc" in full
 
 
-def test_combined_command_propagates_squeue_exit_status():
+def test_combined_command_propagates_squeue_exit_status(tmp_path):
     # Run the generated command through a real POSIX shell with squeue/sinfo
     # stubbed: a squeue failure must surface even though sinfo succeeds.
-    cmd = (
-        "squeue() { return 7; }; sinfo() { echo SINFODATA; }; "
-        + collector._build_squeue_cmd(True)
-    )
-    proc = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    _fake_tool(tmp_path, "sinfo", "echo SINFODATA")
+    proc = _run_sh("squeue() { return 7; }; " + collector._build_squeue_cmd(True),
+                   tmp_path)
     assert proc.returncode == 7                 # squeue's status, not sinfo's
     assert "SINFODATA" in proc.stdout            # sinfo still ran
     assert collector.SINFO_SENTINEL in proc.stdout

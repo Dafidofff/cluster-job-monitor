@@ -68,6 +68,12 @@ TRES_SENTINEL = "@@TRES"
 SINFO_FORMAT = ("NodeHost:64,Partition:64,StateLong:32,CPUsState:32,"
                 "Gres:256,GresUsed:256")
 SINFO_SENTINEL = "@@SINFO"
+# Wall-clock cap (seconds) on the sinfo probe. `sinfo -N` scales badly: its
+# cost grows roughly with the square of the node x partition row count, so a
+# cluster with ~2000 nodes in 8 partitions takes over a minute. Capped, a slow
+# sinfo only costs the capacity data (narrow it with the host's "partitions"
+# list) instead of running the whole host into its timeout.
+SINFO_TIMEOUT = 15
 
 # Budget/accounting probes (opt-in per host via the "accounting" config key).
 # Two independent sources, each behind its own sentinel so _collect_host can
@@ -94,6 +100,10 @@ PENDING_STATES = {"PENDING"}
 DEFAULT_SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 # Per-host wall-clock cap so a hung connection can never stall the refresh.
 HOST_TIMEOUT = 25
+# The overview runs more per host (sinfo, cluster-wide queue, accounting), each
+# probe with its own cap; this must exceed the sum of those caps so the caps,
+# not this timeout, are what cut a slow probe short.
+OVERVIEW_HOST_TIMEOUT = 45
 
 
 # --------------------------------------------------------------------------- #
@@ -517,12 +527,18 @@ def _norm_node_state(raw: str) -> str:
     return "other"
 
 
-def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
+def parse_sinfo_output(text: str, gpus_per_node: int = 0
+                       ) -> tuple[list[Partition], dict]:
     """Parse ``sinfo -N -O SINFO_FORMAT`` into per-partition capacity.
 
     Returns ``(partitions, host_totals)`` where ``host_totals`` holds
     cluster-wide free/total CPUs and GPUs with shared nodes counted once.
     Malformed lines are skipped, so partial output never raises.
+
+    ``gpus_per_node`` is a fallback for clusters that schedule whole nodes and
+    don't register GPUs as GRES (sinfo reports ``(null)``): every node without
+    GPU GRES is then assumed to carry that many GPUs, all of them in use unless
+    the node is idle. Nodes that do report GPU GRES are unaffected.
     """
     parts: dict[str, Partition] = {}
     seen_nodes: dict[str, tuple[int, int, int, int]] = {}
@@ -544,8 +560,17 @@ def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
 
         gpu_total = parse_gpus(gres)
         gpu_used = parse_gpus(gres_used)
+        node_total_by_type = parse_gpus_by_type(gres)
+        node_used_by_type = parse_gpus_by_type(gres_used)
         state = _norm_node_state(raw_state)
         usable = state in _USABLE_NODE_STATES
+        if gpu_total == 0 and gpus_per_node > 0:
+            # No GPU GRES on this node: fall back to the configured count.
+            # Whole-node scheduling means a busy node has none to spare.
+            gpu_total = gpus_per_node
+            gpu_used = gpus_per_node if state in ("mixed", "allocated") else 0
+            node_total_by_type = {"gpu": gpu_total}
+            node_used_by_type = {"gpu": gpu_used}
         gpu_free = max(0, gpu_total - gpu_used) if usable else 0
 
         p = parts.get(pname)
@@ -560,8 +585,6 @@ def parse_sinfo_output(text: str) -> tuple[list[Partition], dict]:
         p.gpus_alloc += gpu_used
         p.gpus_total += gpu_total
         # Per-type GPU breakdown (a100/h100/...): free is gated on usable state.
-        node_total_by_type = parse_gpus_by_type(gres)
-        node_used_by_type = parse_gpus_by_type(gres_used)
         for typ, tot in node_total_by_type.items():
             bucket = p.gpus_by_type.setdefault(typ, {"free": 0, "alloc": 0, "total": 0})
             used = node_used_by_type.get(typ, 0)
@@ -950,6 +973,18 @@ def _slice_between(text: str, start: str, stops: tuple[str, ...]) -> str:
     return seg[:cut]
 
 
+def _timeout_guard(var: str, seconds: int) -> str:
+    """Shell fragment that sets ``$var`` to ``timeout <seconds>`` if it can.
+
+    Prefix a probe with the unquoted ``$var`` to cap its wall-clock time.
+    `timeout` is coreutils — on every Linux cluster, but not guaranteed on a
+    "local" host (stock macOS lacks it) — so the variable is left empty there
+    and the probe runs uncapped.
+    """
+    return (f"if command -v timeout >/dev/null 2>&1; "
+            f"then {var}='timeout {seconds}'; else {var}=; fi; ")
+
+
 def _build_accounting_cmd(spec: dict) -> str:
     """Build the accounting-probe fragment for one host's config.
 
@@ -963,10 +998,7 @@ def _build_accounting_cmd(spec: dict) -> str:
     if not mode:
         return ""
     account = spec.get("accounting_account")
-    # `timeout` is coreutils — on every Linux cluster, but not guaranteed on a
-    # "local" host (stock macOS lacks it) — so fall back to running uncapped.
-    guard = (f"if command -v timeout >/dev/null 2>&1; "
-             f"then _t='timeout {ACCOUNTING_TIMEOUT}'; else _t=; fi; ")
+    guard = _timeout_guard("_t", ACCOUNTING_TIMEOUT)
 
     if mode == "sacctmgr":
         acct_filter = f" Accounts={shlex.quote(account)}" if account else ""
@@ -1012,23 +1044,36 @@ def _extract_budgets(spec: dict, text: str) -> tuple[str, list[Budget]]:
     return text, []
 
 
-def _build_squeue_cmd(with_partitions: bool = False, accounting_cmd: str = "") -> str:
+def _build_squeue_cmd(with_partitions: bool = False, accounting_cmd: str = "",
+                      partitions: Optional[list] = None) -> str:
     # Same single SSH round-trip. The base always carries a second --me pass
     # (@@TRES) for GPU counts (see SQUEUE_TRES_FORMAT); the overview adds sinfo
     # capacity and the cluster-wide queue; hosts with "accounting" configured
     # add budget probes. ``exit $rc`` propagates the primary --me squeue status
     # so a real squeue failure is still surfaced, while a missing/failing tres,
     # sinfo, queue, or accounting probe only loses that extra data.
+    #
+    # ``partitions`` (the host's "partitions" config list) narrows the capacity
+    # and cluster-wide queue probes to those partitions. Besides trimming the
+    # table to what the user cares about, it is what keeps sinfo fast on very
+    # large clusters (see SINFO_TIMEOUT). The --me passes are never filtered.
     squeue = f"squeue --me --noheader -o '{SQUEUE_FORMAT}'"
     tres = f"squeue --me -h -O '{SQUEUE_TRES_FORMAT}'"
     parts = [f"{squeue}; rc=$?;",
              f"echo '{TRES_SENTINEL}'; {tres} 2>/dev/null || true;"]
     if with_partitions:
-        sinfo = f"sinfo -h -N -O '{SINFO_FORMAT}'"
-        queue = f"squeue -a -h -o '{QUEUE_FORMAT}'"
-        # tr squeezes SINFO_FORMAT's wide column padding before it is sent.
+        names = [str(p).strip() for p in (partitions or []) if str(p).strip()]
+        pflag = f" -p {shlex.quote(','.join(names))}" if names else ""
+        sinfo = f"sinfo -h -N{pflag} -O '{SINFO_FORMAT}'"
+        queue = f"squeue -a -h{pflag} -o '{QUEUE_FORMAT}'"
+        # sinfo's output is held in a variable and only emitted if sinfo
+        # finished, so a probe cut off by the cap can never leave a partial
+        # node list that would be read as (too little) capacity. tr squeezes
+        # SINFO_FORMAT's wide column padding before it is sent.
         parts.append(f"echo '{SINFO_SENTINEL}'; "
-                     f"{sinfo} 2>/dev/null | tr -s ' ' || true;")
+                     f"{_timeout_guard('_ts', SINFO_TIMEOUT)}"
+                     f"_o=$($_ts {sinfo} 2>/dev/null) && "
+                     f"printf '%s\\n' \"$_o\" | tr -s ' ' || true;")
         parts.append(f"echo '{QUEUE_SENTINEL}'; {queue} 2>/dev/null || true;")
     if accounting_cmd:
         parts.append(accounting_cmd + ";")
@@ -1044,7 +1089,9 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
     accounting_cmd = (_build_accounting_cmd(spec)
                       if host.kind == "slurm" and with_partitions else "")
     remote_cmd = (GPU_CMD if host.kind == "gpu"
-                  else _build_squeue_cmd(with_partitions, accounting_cmd))
+                  else _build_squeue_cmd(with_partitions, accounting_cmd,
+                                         spec.get("partitions")))
+    timeout = OVERVIEW_HOST_TIMEOUT if with_partitions else HOST_TIMEOUT
 
     if spec.get("local"):
         argv = ["/bin/sh", "-c", remote_cmd]
@@ -1063,11 +1110,11 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
             argv,
             capture_output=True,
             text=True,
-            timeout=HOST_TIMEOUT,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         host.ok = False
-        host.error = f"timed out after {HOST_TIMEOUT}s"
+        host.error = f"timed out after {timeout}s"
         return host
     except FileNotFoundError as exc:
         host.ok = False
@@ -1131,7 +1178,8 @@ def _collect_host(spec: dict, with_partitions: bool = False) -> Host:
                 if job.gpus == 0:
                     job.gpus = tres_gpus.get(job.jobid, 0)
         if with_partitions:
-            partitions, totals = parse_sinfo_output(sinfo_text)
+            partitions, totals = parse_sinfo_output(
+                sinfo_text, gpus_per_node=_to_int(spec.get("gpus_per_node")))
             _fold_my_jobs(partitions, host.jobs)
             if queue_text.strip():
                 _fold_queue(partitions, parse_queue_output(queue_text))

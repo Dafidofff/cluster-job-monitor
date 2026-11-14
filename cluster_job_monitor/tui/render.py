@@ -353,6 +353,10 @@ def _pending_eta_text(my_pending: list[dict]) -> Optional[Text]:
     return t
 
 
+_NO_SINFO_HINT = ("no capacity data — sinfo unavailable or too slow "
+                  "(set \"partitions\" for this host to narrow it)")
+
+
 def render_overview(overview: dict) -> RenderableType:
     """Render build_overview() output as one panel per cluster."""
     clusters = overview.get("clusters", [])
@@ -378,13 +382,17 @@ def render_overview(overview: dict) -> RenderableType:
         if not c["ok"]:
             body: RenderableType = Text(f"unreachable — {c['error']}", style="red")
         elif c["partitions"]:
-            table = _partitions_table(c["partitions"])
-            eta = _pending_eta_text(c.get("my_pending_jobs"))
-            body = Group(table, eta) if eta else table
+            extras = [_pending_eta_text(c.get("my_pending_jobs"))]
+            if c["kind"] != "gpu" and not cap["cpus"]:
+                # Rows exist only because the user's jobs name them: sinfo
+                # itself returned nothing (missing, or cut off by its cap).
+                extras.append(Text(_NO_SINFO_HINT, style="dim italic"))
+            body = Group(_partitions_table(c["partitions"]),
+                         *[e for e in extras if e])
         elif c["kind"] == "gpu":
             body = Text("GPU host — see free/total above", style="dim italic")
         else:
-            body = Text("no partition data (sinfo unavailable?)", style="dim italic")
+            body = Text(_NO_SINFO_HINT, style="dim italic")
 
         items.append(Panel(
             body, title=title, subtitle=subtitle, subtitle_align="left",

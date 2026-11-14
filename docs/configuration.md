@@ -56,7 +56,8 @@ Each entry in `hosts`:
 | `ssh`        | string/null | —         | The `~/.ssh/config` alias. Use `null` together with `"local": true`.        |
 | `local`      | bool        | `false`   | `true` for the machine you run the tool on (commands run locally, no SSH).  |
 | `scheduler`  | string      | `"slurm"` | `"slurm"` for SLURM hosts; `"gpu"` for a non-SLURM GPU box (see below).      |
-| `partitions` | list        | `[]`      | Partition names to surface; informational for filtering/labels.             |
+| `partitions` | list        | `[]`      | Limit the capacity overview to these partitions (empty = all). See [Large clusters](#large-clusters). |
+| `gpus_per_node` | int      | —         | GPUs per node, for clusters that don't register GPUs as GRES. See [Clusters without GPU GRES](#clusters-without-gpu-gres). |
 | `minimized`  | bool        | `false`   | Start this cluster collapsed to a one-line summary.                         |
 
 Example:
@@ -99,6 +100,39 @@ or login node alongside remote clusters.
 Add `"minimized": true` to start a cluster collapsed to a one-line summary
 (`▸`). You can still toggle it live with the number keys or `m` — see the
 [keybindings](#keybindings) below.
+
+## Large clusters
+
+The capacity overview lists every node once per partition (`sinfo -N`), and
+that query gets slow quickly as clusters grow: around 2,000 nodes in eight
+partitions takes over a minute. The overview caps `sinfo` at 15 seconds; when
+the cap is hit the cluster still shows your jobs, but no partition table.
+
+Set `partitions` to the ones you submit to and the overview only queries those,
+which brings it back to a few seconds:
+
+```json
+{ "name": "BigCluster", "ssh": "big", "partitions": ["batch", "backfill"] }
+```
+
+The filter applies to the capacity table and the cluster-wide queue estimate,
+so the cluster's free/total figures then cover only those partitions. Your own
+jobs are always listed, whichever partition they are in.
+
+## Clusters without GPU GRES
+
+Some clusters schedule whole nodes and don't register GPUs as SLURM GRES, so
+`sinfo` reports `(null)` and the overview shows no GPUs at all. Tell the
+monitor how many GPUs each node has:
+
+```json
+{ "name": "WholeNode", "ssh": "wn", "gpus_per_node": 8 }
+```
+
+Every node without GPU GRES is then counted as having that many GPUs, all of
+them in use unless the node is idle. It is an assumption, not a measurement:
+it is wrong for CPU-only nodes on such a cluster. Nodes that do report GPU
+GRES are unaffected.
 
 ## Non-SLURM GPU hosts
 

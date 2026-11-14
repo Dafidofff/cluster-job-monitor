@@ -250,7 +250,7 @@ def test_accounting_probes_are_time_capped(mode, tools, tmp_path, monkeypatch):
         pytest.skip("no `timeout` binary on this machine")
     monkeypatch.setattr(collector, "ACCOUNTING_TIMEOUT", 1)
     for tool in tools:
-        _fake_tool(tmp_path, tool, "sleep 30")
+        _fake_tool(tmp_path, tool, "exec sleep 30")
     acct = _build_accounting_cmd({"accounting": mode})
     cmd = ("squeue() { echo JOBLINE; return 0; }; sinfo() { echo SINFODATA; }; "
            + collector._build_squeue_cmd(True, acct))
