@@ -61,6 +61,39 @@ def test_parse_sinfo_basic_capacity():
                       "gpus_free": 14, "gpus_total": 16}
 
 
+def test_sinfo_columns_are_wide_enough_for_long_gres():
+    # sinfo -O truncates a value at its column width and emits no separator, so
+    # an over-long GRES string would run into the next column and the node
+    # would be dropped. A realistic multi-GRES node must fit with room to spare.
+    widths = dict(f.split(":") for f in collector.SINFO_FORMAT.split(","))
+    gres = "gpu:nvidia_h100-80gb:8(S:0-1),nvme:4,tmpdisk:1048576(S:0-1),shard:64"
+    used = "gpu:nvidia_h100-80gb:3(IDX:0-2),nvme:0,tmpdisk:0,shard:nvidia_h100-80gb:0"
+    assert len(gres) > 50 and len(used) > 50     # the old width
+    assert len(gres) < int(widths["Gres"]) and len(used) < int(widths["GresUsed"])
+    # sinfo pads each value to its width; the remote `tr -s ' '` squeezes it.
+    line = (f"{'node01':<{widths['NodeHost']}}{'gpu_h100':<{widths['Partition']}}"
+            f"{'mixed':<{widths['StateLong']}}{'24/104/0/128':<{widths['CPUsState']}}"
+            f"{gres:<{widths['Gres']}}{used:<{widths['GresUsed']}}\n")
+    parts, totals = parse_sinfo_output(line)
+    assert len(parts) == 1
+    assert parts[0].gpus_total == 8 and parts[0].gpus_alloc == 3
+    assert parts[0].gpus_by_type == {
+        "nvidia_h100-80gb": {"free": 5, "alloc": 3, "total": 8}}
+    assert totals["gpus_free"] == 5
+
+
+def test_sinfo_padding_is_squeezed_remotely():
+    # The wide columns are mostly padding; it must be stripped before it is
+    # sent back over SSH, and a failing sinfo must still be tolerated.
+    full = collector._build_squeue_cmd(True)
+    assert "| tr -s ' '" in full
+    cmd = ("squeue() { echo JOBLINE; return 0; }; "
+           "sinfo() { echo 'node01      gpu     idle'; }; " + full)
+    proc = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    assert proc.returncode == 0
+    assert "node01 gpu idle" in proc.stdout
+
+
 def test_parse_sinfo_excludes_unusable_nodes_from_free_gpus():
     # A drained node may report 0 GPUs used, but its GPUs are not allocatable.
     text = (

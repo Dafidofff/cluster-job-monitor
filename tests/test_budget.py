@@ -12,7 +12,10 @@ same subprocess-mocking idioms as ``tests/test_overview.py``.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import time
 import types
 
 import pytest
@@ -223,10 +226,53 @@ def test_build_accounting_cmd_sacctmgr_account_filter():
 
 def test_build_accounting_cmd_budget_overview_shape_and_args():
     cmd = _build_accounting_cmd({"accounting": "budget-overview"})
-    assert cmd == f"echo '{collector.BUDGET_OVERVIEW_SENTINEL}'; budget-overview 2>/dev/null || true"
+    assert cmd.endswith(f"echo '{collector.BUDGET_OVERVIEW_SENTINEL}'; "
+                        f"$_t budget-overview 2>/dev/null || true")
     cmd2 = _build_accounting_cmd({"accounting": "budget-overview",
                                   "accounting_args": "-p gpu"})
     assert "budget-overview -p gpu 2>/dev/null" in cmd2
+
+
+def _fake_tool(directory, name, body):
+    path = directory / name
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize("mode,tools", [
+    ("sacctmgr", ("sacctmgr", "sreport")),
+    ("budget-overview", ("budget-overview",)),
+])
+def test_accounting_probes_are_time_capped(mode, tools, tmp_path, monkeypatch):
+    # A hung accounting tool must be cut off at ACCOUNTING_TIMEOUT instead of
+    # running into the per-host timeout and costing the host its job data.
+    if shutil.which("timeout") is None:
+        pytest.skip("no `timeout` binary on this machine")
+    monkeypatch.setattr(collector, "ACCOUNTING_TIMEOUT", 1)
+    for tool in tools:
+        _fake_tool(tmp_path, tool, "sleep 30")
+    acct = _build_accounting_cmd({"accounting": mode})
+    cmd = ("squeue() { echo JOBLINE; return 0; }; sinfo() { echo SINFODATA; }; "
+           + collector._build_squeue_cmd(True, acct))
+    env = {"PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}"}
+    start = time.monotonic()
+    proc = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True,
+                          env=env, timeout=20)
+    assert time.monotonic() - start < 10        # nowhere near the 30s sleeps
+    assert proc.returncode == 0
+    assert "JOBLINE" in proc.stdout             # job data survives the hang
+
+
+def test_accounting_probes_run_uncapped_without_timeout_binary(tmp_path):
+    # No `timeout` on PATH (e.g. a stock-macOS "local" host): the probes must
+    # still run, just without the cap.
+    _fake_tool(tmp_path, "sacctmgr", "echo 'prjs0123|cpu=600|'")
+    _fake_tool(tmp_path, "sreport", "echo 'prjs0123|4'")
+    acct = _build_accounting_cmd({"accounting": "sacctmgr"})
+    proc = subprocess.run(["/bin/sh", "-c", acct], capture_output=True, text=True,
+                          env={"PATH": str(tmp_path)})
+    assert proc.returncode == 0
+    assert "prjs0123|cpu=600|" in proc.stdout and "prjs0123|4" in proc.stdout
 
 
 def test_build_squeue_cmd_includes_accounting_and_keeps_exit_last():
